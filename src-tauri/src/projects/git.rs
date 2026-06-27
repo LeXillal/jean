@@ -1,10 +1,20 @@
 use crate::platform::silent_command;
 use crate::platform::wsl_aware_command;
+use once_cell::sync::Lazy;
 use std::path::Path;
+use std::sync::Mutex;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use super::types::{JeanConfig, MergeType};
+
+fn gh_command(gh: &Path, repo_path: &str) -> std::process::Command {
+    crate::platform::resolved_cli_command(gh, Some(Path::new(repo_path)))
+}
+
+static WORKTREE_CREATE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+const WORKTREE_CREATE_ATTEMPTS: usize = 4;
 
 /// Resolve the git metadata directories for a working directory.
 ///
@@ -889,7 +899,7 @@ pub fn git_push_to_pr(
     log::trace!("Pushing to PR #{pr_number} remote branch in {repo_path}");
 
     // 1. Query PR info from GitHub
-    let gh_output = silent_command(gh_binary)
+    let gh_output = gh_command(gh_binary, repo_path)
         .args([
             "pr",
             "view",
@@ -897,7 +907,6 @@ pub fn git_push_to_pr(
             "--json",
             "headRefName,isCrossRepository,headRepositoryOwner,headRepository",
         ])
-        .current_dir(repo_path)
         .output()
         .map_err(|e| format!("Failed to run gh pr view: {e}"))?;
 
@@ -1200,28 +1209,17 @@ pub fn create_worktree(
             .map_err(|e| format!("Failed to create parent directory: {e}"))?;
     }
 
-    // Prune stale worktree entries (folders deleted outside the app)
-    let _ = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["worktree", "prune"])
-        .output();
-
-    // git worktree add -b <new_branch> <path> <base_branch>
-    let output = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args([
+    run_git_worktree_add_with_retry(
+        repo_path,
+        &[
             "worktree",
             "add",
             "-b",
             new_branch_name,
             worktree_path,
             base_branch,
-        ])
-        .output()
-        .map_err(|e| format!("Failed to run git worktree add: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Failed to create worktree: {stderr}"));
-    }
+        ],
+    )?;
 
     log::trace!("Successfully created worktree at {worktree_path}");
     Ok(())
@@ -1247,26 +1245,58 @@ pub fn create_worktree_from_existing_branch(
             .map_err(|e| format!("Failed to create parent directory: {e}"))?;
     }
 
-    // Prune stale worktree entries (folders deleted outside the app)
-    let _ = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["worktree", "prune"])
-        .output();
-
-    // git worktree add <path> <existing_branch> (no -b flag)
-    let output = wsl_aware_command("git", Some(Path::new(repo_path)))
-        .args(["worktree", "add", worktree_path, existing_branch])
-        .output()
-        .map_err(|e| format!("Failed to run git worktree add: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Failed to create worktree: {stderr}"));
-    }
+    run_git_worktree_add_with_retry(
+        repo_path,
+        &["worktree", "add", worktree_path, existing_branch],
+    )?;
 
     log::trace!(
         "Successfully created worktree at {worktree_path} using existing branch {existing_branch}"
     );
     Ok(())
+}
+
+pub fn is_retryable_worktree_create_error(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    lower.contains("could not lock config file")
+        || lower.contains("config.lock")
+        || (lower.contains(".git/config") && lower.contains("file exists"))
+        || lower.contains("unable to write upstream branch configuration")
+}
+
+fn run_git_worktree_add_with_retry(repo_path: &str, args: &[&str]) -> Result<(), String> {
+    let _guard = WORKTREE_CREATE_LOCK
+        .lock()
+        .expect("worktree create mutex poisoned");
+
+    for attempt in 1..=WORKTREE_CREATE_ATTEMPTS {
+        // Prune stale worktree entries (folders deleted outside the app)
+        let _ = wsl_aware_command("git", Some(Path::new(repo_path)))
+            .args(["worktree", "prune"])
+            .output();
+
+        let output = wsl_aware_command("git", Some(Path::new(repo_path)))
+            .args(args)
+            .output()
+            .map_err(|e| format!("Failed to run git worktree add: {e}"))?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if attempt < WORKTREE_CREATE_ATTEMPTS && is_retryable_worktree_create_error(&stderr) {
+            log::warn!(
+                "Retrying git worktree add after retryable config-lock error (attempt {attempt}/{WORKTREE_CREATE_ATTEMPTS}): {stderr}"
+            );
+            std::thread::sleep(Duration::from_millis(150 * attempt as u64));
+            continue;
+        }
+
+        return Err(format!("Failed to create worktree: {stderr}"));
+    }
+
+    Err("Failed to create worktree: retry attempts exhausted".to_string())
 }
 
 /// Checkout a PR using gh CLI in the specified directory
@@ -1330,9 +1360,8 @@ pub fn gh_pr_checkout(
         args.extend(["-b", name]);
     }
 
-    let output = silent_command(gh_binary)
+    let output = gh_command(gh_binary, worktree_path)
         .args(&args)
-        .current_dir(worktree_path)
         .output()
         .map_err(|e| format!("Failed to run gh pr checkout: {e}"))?;
 
@@ -1353,6 +1382,66 @@ pub fn gh_pr_checkout(
 
     log::trace!("Successfully checked out PR #{pr_number} to branch {branch_name}");
     Ok(branch_name)
+}
+
+/// Number of attempts when removing a worktree directory tree.
+const WORKTREE_RM_ATTEMPTS: u32 = 5;
+
+/// Whether a directory-removal error is a transient race worth retrying.
+///
+/// A dev server, file watcher, or backend process can keep writing into the
+/// tree while `remove_dir_all` walks it, so the final `rmdir` fails even though
+/// no handle stays open.
+fn is_transient_dir_removal_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    // `ENOTEMPTY` (39 on Linux, 66 on macOS/BSD) and Windows `ERROR_DIR_NOT_EMPTY`
+    // both surface as `DirectoryNotEmpty`; `EACCES` / Windows `ERROR_ACCESS_DENIED`
+    // as `PermissionDenied`. Using `ErrorKind` keeps the mapping correct across
+    // platforms without hard-coded errno values.
+    if matches!(
+        e.kind(),
+        ErrorKind::DirectoryNotEmpty | ErrorKind::PermissionDenied
+    ) {
+        return true;
+    }
+    // Windows `ERROR_SHARING_VIOLATION` (a lingering file lock) has no dedicated
+    // `ErrorKind`, so match its raw code explicitly.
+    #[cfg(windows)]
+    {
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Recursively remove a directory, retrying briefly on transient races.
+///
+/// Removing a worktree can race with a process still writing inside it (e.g.
+/// `node_modules`, `elm-stuff`), making removal fail with `ENOTEMPTY`
+/// (os error 39) even though nothing holds an open handle. A few short retries
+/// let the writer settle so the removal can finish. Treats an already-absent
+/// path as success.
+fn remove_dir_all_with_retry(path: &Path) -> std::io::Result<()> {
+    let mut attempt = 1;
+    loop {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                if attempt >= WORKTREE_RM_ATTEMPTS || !is_transient_dir_removal_error(&e) {
+                    return Err(e);
+                }
+                log::debug!(
+                    "Retrying directory removal of {} after transient error (attempt {attempt}/{WORKTREE_RM_ATTEMPTS}): {e}",
+                    path.display()
+                );
+                std::thread::sleep(Duration::from_millis(150 * attempt as u64));
+                attempt += 1;
+            }
+        }
+    }
 }
 
 /// Remove a git worktree
@@ -1423,7 +1512,7 @@ pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> Result<(), Strin
                 log::warn!(
                     "git worktree remove failed ({stderr}), attempting manual directory removal"
                 );
-                if let Err(rm_err) = std::fs::remove_dir_all(worktree_path) {
+                if let Err(rm_err) = remove_dir_all_with_retry(Path::new(worktree_path)) {
                     return Err(format!("Failed to remove worktree: {stderr} (manual cleanup also failed: {rm_err})"));
                 }
                 log::info!("Manually removed worktree directory at {worktree_path}");
@@ -1448,7 +1537,12 @@ pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> Result<(), Strin
         log::warn!(
             "Worktree directory still exists after git worktree remove, cleaning up manually"
         );
-        let _ = std::fs::remove_dir_all(worktree_path);
+        // Best-effort: `git worktree remove` already reported success, so a
+        // leftover directory is unexpected. Log the final outcome rather than
+        // swallowing it silently.
+        if let Err(e) = remove_dir_all_with_retry(Path::new(worktree_path)) {
+            log::warn!("Best-effort cleanup of {worktree_path} failed: {e}");
+        }
     }
 
     log::trace!("Successfully removed worktree at {worktree_path}");
@@ -1740,9 +1834,8 @@ pub fn open_pull_request(
 
     log::trace!("Running gh command with args: {:?}", args);
 
-    let output = silent_command(gh_binary)
+    let output = gh_command(gh_binary, repo_path)
         .args(&args)
-        .current_dir(repo_path)
         .output()
         .map_err(|e| format!("Failed to run gh pr create: {e}"))?;
 
@@ -2457,6 +2550,44 @@ mod tests {
     use super::*;
 
     // ========================================================================
+    // remove_dir_all_with_retry tests
+    // ========================================================================
+
+    #[test]
+    fn test_remove_dir_all_with_retry_removes_populated_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("worktree");
+        std::fs::create_dir_all(root.join("nested/deeper")).unwrap();
+        std::fs::write(root.join("nested/file.txt"), b"data").unwrap();
+
+        remove_dir_all_with_retry(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn test_remove_dir_all_with_retry_absent_path_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        // An already-absent path must be treated as success, not an error.
+        remove_dir_all_with_retry(&missing).unwrap();
+    }
+
+    #[test]
+    fn test_is_transient_dir_removal_error_classifies_transient_kinds() {
+        use std::io::ErrorKind;
+        // The "directory not empty" race (ENOTEMPTY / ERROR_DIR_NOT_EMPTY) and a
+        // lingering lock surfacing as PermissionDenied are what we retry on.
+        let dir_not_empty = std::io::Error::from(ErrorKind::DirectoryNotEmpty);
+        assert!(is_transient_dir_removal_error(&dir_not_empty));
+        let permission = std::io::Error::from(ErrorKind::PermissionDenied);
+        assert!(is_transient_dir_removal_error(&permission));
+
+        // A non-transient error (e.g. ENOENT/NotFound) must not be retried here.
+        let not_found = std::io::Error::from(ErrorKind::NotFound);
+        assert!(!is_transient_dir_removal_error(&not_found));
+    }
+
+    // ========================================================================
     // get_repo_name tests
     // ========================================================================
 
@@ -2530,6 +2661,25 @@ mod tests {
                       To choose either option permanently, see push.default in git-config.\n\
                       fatal: push.default is set to simple";
         assert!(git_push_needs_upstream_retry(stderr));
+    }
+
+    #[test]
+    fn retryable_worktree_create_error_detects_git_config_lock() {
+        let stderr = "Preparing worktree (new branch 'issue-10593')\n\
+                      error: could not lock config file .git/config: File exists\n\
+                      error: unable to write upstream branch configuration";
+
+        assert!(is_retryable_worktree_create_error(stderr));
+    }
+
+    #[test]
+    fn retryable_worktree_create_error_rejects_real_conflicts() {
+        assert!(!is_retryable_worktree_create_error(
+            "fatal: a branch named 'issue-10593' already exists"
+        ));
+        assert!(!is_retryable_worktree_create_error(
+            "fatal: '/tmp/project/issue-10593' already exists"
+        ));
     }
 
     #[test]

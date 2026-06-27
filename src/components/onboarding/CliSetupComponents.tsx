@@ -502,7 +502,9 @@ export function CliPathSelector({
             )}
           </div>
           <div className="text-sm text-muted-foreground">
-            {pathFound ? `Version: ${pathVersion || 'unknown'}` : 'Not detected'}
+            {pathFound
+              ? `Version: ${pathVersion || 'unknown'}`
+              : 'Not detected'}
           </div>
           {pathFound && pathPath && (
             <div className="text-xs text-muted-foreground mt-1 break-all">
@@ -521,7 +523,9 @@ export function CliPathSelector({
         >
           <div className="flex items-center justify-between">
             <div className="font-medium">
-              {jeanInstalled ? `Use Jean-managed ${cliName}` : 'Install with Jean'}
+              {jeanInstalled
+                ? `Use Jean-managed ${cliName}`
+                : 'Install with Jean'}
             </div>
             {currentSource === 'jean' && (
               <span className="text-xs px-2 py-0.5 rounded bg-primary/20 text-primary">

@@ -7,6 +7,9 @@ export type PreferencePane =
   | 'codex'
   | 'opencode'
   | 'cursor'
+  | 'pi'
+  | 'commandcode'
+  | 'grok'
   | 'github'
   | 'coderabbit'
   | 'appearance'
@@ -24,7 +27,6 @@ export type PreferencePane =
 export type OnboardingStartStep = 'claude' | 'gh' | null
 
 export type WorktreePrimarySurface = 'chat' | 'terminal'
-
 export type NewSessionModeOrigin = 'chat' | 'modal' | 'canvas'
 export type NewSessionModeIntent = 'picker' | 'default'
 
@@ -40,7 +42,10 @@ export type CliUpdateModalType =
   | 'gh'
   | 'codex'
   | 'opencode'
+  | 'pi'
   | 'coderabbit'
+  | 'commandcode'
+  | 'grok'
   | null
 
 export type CliLoginModalType =
@@ -49,6 +54,9 @@ export type CliLoginModalType =
   | 'codex'
   | 'opencode'
   | 'cursor'
+  | 'pi'
+  | 'commandcode'
+  | 'grok'
   | 'coderabbit'
   | null
 
@@ -169,12 +177,10 @@ interface UIState {
     projectPath?: string | null,
     branch?: string | null
   ) => void
-  openCliUpdateModal: (
-    type: 'claude' | 'gh' | 'codex' | 'opencode' | 'coderabbit'
-  ) => void
+  openCliUpdateModal: (type: Exclude<CliUpdateModalType, null>) => void
   closeCliUpdateModal: () => void
   openCliLoginModal: (
-    type: 'claude' | 'gh' | 'codex' | 'opencode' | 'cursor' | 'coderabbit',
+    type: Exclude<CliLoginModalType, null>,
     command: string,
     commandArgs?: string[],
     action?: 'login' | 'update' | 'install'
@@ -502,7 +508,10 @@ export const useUIStore = create<UIState>()(
 
       setReleaseNotesModalOpen: open =>
         set(
-          { releaseNotesModalOpen: open },
+          state =>
+            state.releaseNotesModalOpen === open
+              ? state
+              : { releaseNotesModalOpen: open },
           undefined,
           'setReleaseNotesModalOpen'
         ),

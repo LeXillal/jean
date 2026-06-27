@@ -50,6 +50,8 @@ struct ChunkEvent {
     session_id: String,
     worktree_id: String,
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -583,6 +585,33 @@ pub fn build_turn_start_params(
     params
 }
 
+/// Build JSON-RPC params for `turn/steer` — injects user input into a running turn.
+/// The request fails server-side when `expectedTurnId` no longer matches the
+/// active turn (turn ended), which callers treat as a fallback signal.
+pub fn build_turn_steer_params(thread_id: &str, turn_id: &str, text: &str) -> serde_json::Value {
+    build_turn_steer_params_with_input(
+        thread_id,
+        turn_id,
+        vec![serde_json::json!({
+            "type": "text",
+            "text": text,
+            "text_elements": [],
+        })],
+    )
+}
+
+pub fn build_turn_steer_params_with_input(
+    thread_id: &str,
+    turn_id: &str,
+    input: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "threadId": thread_id,
+        "expectedTurnId": turn_id,
+        "input": input,
+    })
+}
+
 // =============================================================================
 // Execution via app-server
 // =============================================================================
@@ -928,6 +957,53 @@ fn append_codex_thread_snapshot_to_history_file(
     let existing = std::fs::read_to_string(output_file).unwrap_or_default();
     let existing_lines: std::collections::HashSet<&str> = existing.lines().map(str::trim).collect();
 
+    // Snapshot items use synthetic `item-N` ids while live-written lines use
+    // real ids (msg_…, rs_…). Collect (type, text, id) of existing text items
+    // so re-snapshotted duplicates of already-written items are skipped.
+    let mut existing_text_items: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+    for line in existing.lines() {
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(item) = msg.get("item") else {
+            continue;
+        };
+        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if item_type != "agent_message" && item_type != "reasoning" {
+            continue;
+        }
+        let Some(text) = item.get("text").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        existing_text_items
+            .entry((item_type.to_string(), text.to_string()))
+            .or_insert_with(|| id.to_string());
+    }
+    let is_known_text_item = |line: &str| -> bool {
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
+            return false;
+        };
+        let Some(item) = msg.get("item") else {
+            return false;
+        };
+        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if item_type != "agent_message" && item_type != "reasoning" {
+            return false;
+        }
+        let Some(text) = item.get("text").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        match existing_text_items.get(&(item_type.to_string(), text.to_string())) {
+            Some(first_id) => {
+                first_id != id && (first_id.starts_with("item-") || id.starts_with("item-"))
+            }
+            None => false,
+        }
+    };
+
     let mut writer = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -935,7 +1011,7 @@ fn append_codex_thread_snapshot_to_history_file(
         .map_err(|e| format!("Failed to open Codex recovery history: {e}"))?;
 
     for line in lines {
-        if existing_lines.contains(line.as_str()) {
+        if existing_lines.contains(line.as_str()) || is_known_text_item(&line) {
             continue;
         }
         writeln!(writer, "{line}")
@@ -1078,6 +1154,19 @@ pub fn resume_codex_after_crash(
                     thread_id.to_string(),
                     codex_turn_id.unwrap_or_default().to_string(),
                 );
+
+                // Backfill items that completed while Jean was closed. Live
+                // notifications only cover events from reconnect onward; the
+                // resume snapshot holds the earlier ones. Existing lines are
+                // skipped (exact-line dedupe) and the parser upserts by item id.
+                if let Err(e) = append_codex_thread_snapshot_to_history_file(
+                    &output_file,
+                    &response,
+                    codex_turn_id,
+                    false,
+                ) {
+                    log::warn!("Failed to backfill Codex resume snapshot: {e}");
+                }
 
                 // Determine execution mode from run metadata (single load)
                 let exec_mode = super::storage::load_metadata(app, session_id)?.and_then(|m| {
@@ -1449,6 +1538,7 @@ fn process_turn_events(
                     app,
                     session_id,
                     worktree_id,
+                    run_id,
                     &method,
                     &params,
                     &mut full_content,
@@ -1485,6 +1575,13 @@ fn process_turn_events(
                                 log::warn!("Failed to persist codex_turn_id on run: {e}");
                             }
                         }
+                        // Steer any prompts that were queued before the turn
+                        // became steerable (auto-steer preference, default on).
+                        super::commands::trigger_codex_queue_steer(
+                            app.clone(),
+                            worktree_id.to_string(),
+                            session_id.to_string(),
+                        );
                     }
                 }
             }
@@ -1633,6 +1730,7 @@ fn process_turn_events(
                 worktree_id: worktree_id.to_string(),
                 undo_send: false,
                 emitted_at_ms,
+                run_id: Some(run_id.to_string()),
             },
         );
     }
@@ -1709,6 +1807,14 @@ fn notification_to_history_line(method: &str, params: &serde_json::Value) -> Opt
             let line = serde_json::json!({ "type": "item.completed", "item": normalized });
             return Some(serde_json::to_string(&line).ok()?);
         }
+        "item/fileChange/patchUpdated" => {
+            let line = serde_json::json!({
+                "type": "item.file_change.patch_updated",
+                "item_id": params.get("itemId").cloned().unwrap_or(serde_json::Value::Null),
+                "changes": params.get("changes").cloned().unwrap_or(serde_json::json!([])),
+            });
+            return Some(serde_json::to_string(&line).ok()?);
+        }
         "item/agentMessage/delta" => {
             // Delta events don't have a direct old-format equivalent; skip for history
             return None;
@@ -1738,6 +1844,7 @@ fn process_server_notification(
     app: &tauri::AppHandle,
     session_id: &str,
     worktree_id: &str,
+    run_id: &str,
     method: &str,
     params: &serde_json::Value,
     full_content: &mut String,
@@ -1777,6 +1884,7 @@ fn process_server_notification(
                             session_id: session_id.to_string(),
                             worktree_id: worktree_id.to_string(),
                             content: delta.to_string(),
+                            run_id: Some(run_id.to_string()),
                         },
                     );
                 }
@@ -1863,6 +1971,7 @@ fn process_server_notification(
                 app,
                 session_id,
                 worktree_id,
+                run_id,
                 &event_msg,
                 event_type,
                 full_content,
@@ -1957,6 +2066,7 @@ fn process_server_notification(
                 app,
                 session_id,
                 worktree_id,
+                run_id,
                 &event_msg,
                 event_type,
                 full_content,
@@ -1967,6 +2077,31 @@ fn process_server_notification(
                 completed,
                 usage,
                 error_emitted,
+            );
+        }
+        "item/fileChange/patchUpdated" => {
+            let item_id = params.get("itemId").and_then(|v| v.as_str()).unwrap_or("");
+            let changes = params
+                .get("changes")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]));
+            let tool_id = upsert_file_change_tool_call(
+                tool_calls,
+                content_blocks,
+                pending_tool_ids,
+                item_id,
+                changes.clone(),
+            );
+            let _ = app.emit_all(
+                "chat:tool_use",
+                &ToolUseEvent {
+                    session_id: session_id.to_string(),
+                    worktree_id: worktree_id.to_string(),
+                    id: tool_id,
+                    name: "FileChange".to_string(),
+                    input: changes,
+                    parent_tool_use_id: None,
+                },
             );
         }
         "item/commandExecution/outputDelta" | "item/fileChange/outputDelta" => {
@@ -2042,6 +2177,13 @@ fn process_server_notification(
                         .unwrap_or(0),
                     cache_creation_input_tokens: 0,
                 });
+            }
+        }
+        "account/rateLimits/updated" => {
+            if let Err(e) =
+                crate::codex_cli::update_codex_usage_from_app_server_rate_limits(app, params)
+            {
+                log::warn!("Failed to update Codex usage from rate limits notification: {e}");
             }
         }
         "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
@@ -2520,12 +2662,48 @@ fn format_codex_user_error(error_msg: &str) -> String {
     }
 }
 
+fn upsert_file_change_tool_call(
+    tool_calls: &mut Vec<ToolCall>,
+    content_blocks: &mut Vec<ContentBlock>,
+    pending_tool_ids: &mut HashMap<String, String>,
+    item_id: &str,
+    changes: serde_json::Value,
+) -> String {
+    let tool_id = if item_id.is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        item_id.to_string()
+    };
+
+    if let Some(tool) = tool_calls.iter_mut().find(|tool| tool.id == tool_id) {
+        tool.input = changes;
+    } else {
+        tool_calls.push(ToolCall {
+            id: tool_id.clone(),
+            name: "FileChange".to_string(),
+            input: changes,
+            output: None,
+            parent_tool_use_id: None,
+        });
+        content_blocks.push(ContentBlock::ToolUse {
+            tool_call_id: tool_id.clone(),
+        });
+    }
+
+    if !item_id.is_empty() {
+        pending_tool_ids.insert(item_id.to_string(), tool_id.clone());
+    }
+
+    tool_id
+}
+
 /// Process a single Codex JSONL event. Shared between attached and detached tailers.
 #[allow(clippy::too_many_arguments)]
 fn process_codex_event(
     app: &tauri::AppHandle,
     session_id: &str,
     worktree_id: &str,
+    run_id: &str,
     msg: &serde_json::Value,
     event_type: &str,
     full_content: &mut String,
@@ -2592,28 +2770,17 @@ fn process_codex_event(
                     );
                 }
                 "file_change" => {
-                    let tool_id = if item_id.is_empty() {
-                        uuid::Uuid::new_v4().to_string()
-                    } else {
-                        item_id.to_string()
-                    };
                     let changes = item
                         .get("changes")
                         .cloned()
-                        .unwrap_or(serde_json::Value::Null);
-                    tool_calls.push(ToolCall {
-                        id: tool_id.clone(),
-                        name: "FileChange".to_string(),
-                        input: changes.clone(),
-                        output: None,
-                        parent_tool_use_id: None,
-                    });
-                    content_blocks.push(ContentBlock::ToolUse {
-                        tool_call_id: tool_id.clone(),
-                    });
-                    if !item_id.is_empty() {
-                        pending_tool_ids.insert(item_id.to_string(), tool_id.clone());
-                    }
+                        .unwrap_or_else(|| serde_json::json!([]));
+                    let tool_id = upsert_file_change_tool_call(
+                        tool_calls,
+                        content_blocks,
+                        pending_tool_ids,
+                        item_id,
+                        changes.clone(),
+                    );
                     let _ = app.emit_all(
                         "chat:tool_use",
                         &ToolUseEvent {
@@ -2924,6 +3091,7 @@ fn process_codex_event(
                                         session_id: session_id.to_string(),
                                         worktree_id: worktree_id.to_string(),
                                         content: text.to_string(),
+                                        run_id: Some(run_id.to_string()),
                                     },
                                 );
                             }
@@ -3246,6 +3414,74 @@ fn process_codex_event(
 // JSONL history parser (for loading saved sessions)
 // =============================================================================
 
+/// Return true when a persisted Codex run log contains anything that should
+/// render as assistant-side output, even if the run was cancelled before
+/// metadata received a final assistant_message_id.
+pub(crate) fn codex_run_log_has_visible_assistant_artifacts(
+    lines: &[String],
+    is_plan_mode: bool,
+) -> bool {
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+
+        if msg
+            .get("_run_meta")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        match msg
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+        {
+            "turn.plan_updated" | "item.plan.delta" if is_plan_mode => return true,
+            "turn.completed" => {
+                if msg
+                    .get("output")
+                    .and_then(extract_text_from_turn_output)
+                    .is_some_and(|text| !text.trim().is_empty())
+                {
+                    return true;
+                }
+            }
+            "item.started" | "item.completed" => {
+                let item = msg.get("item").unwrap_or(&serde_json::Value::Null);
+                let item_type = item
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                match item_type {
+                    "agent_message" => {
+                        if extract_agent_message_text(item)
+                            .is_some_and(|text| !text.trim().is_empty())
+                        {
+                            return true;
+                        }
+                    }
+                    "plan" if is_plan_mode => return true,
+                    "command_execution" | "file_change" | "mcp_tool_call" | "collab_tool_call"
+                    | "todo_list" | "web_search" | "image_generation" | "image_view"
+                    | "context_compaction" | "dynamic_tool_call" => return true,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    false
+}
+
 /// Parse stored Codex JSONL into a ChatMessage (for loading history).
 ///
 /// Maps Codex events to the same ChatMessage format used by Claude sessions.
@@ -3263,6 +3499,25 @@ pub fn parse_codex_run_to_message(
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
     let mut pending_tool_ids: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    // Crash-recovery snapshots renumber agent_message/reasoning items to
+    // synthetic `item-N` ids while live notifications use real ids (msg_…,
+    // rs_…). Track (type, text) → first id so the same item appended under
+    // both id schemes renders once. Two REAL ids with identical text are
+    // kept (legitimate repeated model output).
+    let mut seen_text_items: std::collections::HashMap<(&'static str, String), String> =
+        std::collections::HashMap::new();
+    let mut is_duplicate_text_item = |kind: &'static str, text: &str, item_id: &str| -> bool {
+        match seen_text_items.entry((kind, text.to_string())) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(item_id.to_string());
+                false
+            }
+            std::collections::hash_map::Entry::Occupied(e) => {
+                let first_id = e.get();
+                first_id == item_id || first_id.starts_with("item-") || item_id.starts_with("item-")
+            }
+        }
+    };
 
     for line in lines {
         if line.trim().is_empty() {
@@ -3285,6 +3540,16 @@ pub fn parse_codex_run_to_message(
         let event_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         match event_type {
+            // User text injected mid-turn via `turn/steer` (written by steer_codex_turn).
+            // Codex's own userMessage items are filtered (unordered duplicates) —
+            // this explicit line is the single source of truth for transcript order.
+            "steered_user_message" => {
+                if let Some(text) = msg.get("text").and_then(|v| v.as_str()) {
+                    content_blocks.push(ContentBlock::UserInput {
+                        text: text.to_string(),
+                    });
+                }
+            }
             "turn.plan_updated" => {
                 if !is_plan_mode {
                     continue;
@@ -3383,26 +3648,14 @@ pub fn parse_codex_run_to_message(
                         let changes = item
                             .get("changes")
                             .cloned()
-                            .unwrap_or(serde_json::Value::Null);
-                        let tool_id = if item_id.is_empty() {
-                            Uuid::new_v4().to_string()
-                        } else {
-                            item_id.to_string()
-                        };
-
-                        tool_calls.push(ToolCall {
-                            id: tool_id.clone(),
-                            name: "FileChange".to_string(),
-                            input: changes,
-                            output: None,
-                            parent_tool_use_id: None,
-                        });
-                        content_blocks.push(ContentBlock::ToolUse {
-                            tool_call_id: tool_id.clone(),
-                        });
-                        if !item_id.is_empty() {
-                            pending_tool_ids.insert(item_id.to_string(), tool_id);
-                        }
+                            .unwrap_or_else(|| serde_json::json!([]));
+                        upsert_file_change_tool_call(
+                            &mut tool_calls,
+                            &mut content_blocks,
+                            &mut pending_tool_ids,
+                            item_id,
+                            changes,
+                        );
                     }
                     "mcp_tool_call" => {
                         let server = item
@@ -3487,6 +3740,20 @@ pub fn parse_codex_run_to_message(
                     _ => {}
                 }
             }
+            "item.file_change.patch_updated" => {
+                let item_id = msg.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
+                let changes = msg
+                    .get("changes")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([]));
+                upsert_file_change_tool_call(
+                    &mut tool_calls,
+                    &mut content_blocks,
+                    &mut pending_tool_ids,
+                    item_id,
+                    changes,
+                );
+            }
             "item.completed" => {
                 let item = msg.get("item").unwrap_or(&serde_json::Value::Null);
                 let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -3528,6 +3795,9 @@ pub fn parse_codex_run_to_message(
                     "agent_message" => {
                         if let Some(text) = extract_agent_message_text(item) {
                             if run.cancelled && content == text {
+                                continue;
+                            }
+                            if is_duplicate_text_item("agent_message", &text, item_id) {
                                 continue;
                             }
                             content.push_str(&text);
@@ -3584,6 +3854,9 @@ pub fn parse_codex_run_to_message(
                     }
                     "reasoning" => {
                         if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                            if is_duplicate_text_item("reasoning", text, item_id) {
+                                continue;
+                            }
                             content_blocks.push(ContentBlock::Thinking {
                                 thinking: text.to_string(),
                             });
@@ -3760,7 +4033,7 @@ pub fn execute_one_shot_codex(
 ) -> Result<String, String> {
     let cli_path = crate::codex_cli::resolve_cli_binary(app)?;
 
-    if !cli_path.exists() {
+    if !crate::platform::resolved_cli_exists(&cli_path) {
         return Err("Codex CLI not installed".to_string());
     }
 
@@ -3779,19 +4052,37 @@ pub fn execute_one_shot_codex(
     std::fs::write(&schema_file, output_schema)
         .map_err(|e| format!("Failed to write schema file: {e}"))?;
 
-    let mut cmd = crate::platform::silent_command(&cli_path);
+    let wsl = crate::platform::get_wsl_config();
+    let schema_arg = if cfg!(windows) && wsl.enabled {
+        std::path::PathBuf::from(crate::platform::win_to_wsl_path(
+            &schema_file.to_string_lossy(),
+        ))
+    } else {
+        schema_file.clone()
+    };
+    let working_dir_arg = working_dir.map(|dir| {
+        if cfg!(windows) && wsl.enabled {
+            std::path::PathBuf::from(crate::platform::win_to_wsl_path(&dir.to_string_lossy()))
+        } else {
+            dir.to_path_buf()
+        }
+    });
+
+    let mut cmd = crate::platform::resolved_cli_command(&cli_path, working_dir);
     cmd.args(build_one_shot_codex_args(
         actual_model,
         is_fast,
-        &schema_file,
-        working_dir,
+        &schema_arg,
+        working_dir_arg.as_deref(),
     ));
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    if let Some(dir) = working_dir {
-        cmd.current_dir(dir);
+    if !wsl.enabled {
+        if let Some(dir) = working_dir {
+            cmd.current_dir(dir);
+        }
     }
 
     let mut child = cmd
@@ -3923,6 +4214,7 @@ fn build_one_shot_codex_args(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use crate::chat::types::{RunEntry, RunStatus};
@@ -4009,6 +4301,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_codex_run_updates_file_change_from_patch_updated() {
+        let run = test_run_entry();
+        let lines = vec![
+            r#"{"type":"item.started","item":{"id":"fc-1","type":"file_change","changes":[]}}"#.to_string(),
+            r#"{"type":"item.file_change.patch_updated","item_id":"fc-1","changes":[{"path":"src/lib.rs","kind":{"type":"update"},"diff":"@@ -1 +1 @@\n-old\n+new\n"}]}"#.to_string(),
+        ];
+
+        let msg = parse_codex_run_to_message(&lines, &run).expect("parse");
+        let file_change = msg
+            .tool_calls
+            .iter()
+            .find(|tool| tool.name == "FileChange")
+            .expect("file change tool");
+
+        assert_eq!(file_change.input[0]["path"], "src/lib.rs");
+        assert!(file_change.input[0]["diff"]
+            .as_str()
+            .expect("diff")
+            .contains("+new"));
+    }
+
+    #[test]
     fn codex_thread_snapshot_history_lines_normalizes_and_skips_user_items() {
         let response = serde_json::json!({
             "thread": {
@@ -4057,6 +4371,139 @@ mod tests {
         assert_eq!(agent["type"], "item.completed");
         assert_eq!(agent["item"]["type"], "agent_message");
         assert_eq!(agent["item"]["text"], "done");
+    }
+
+    fn test_run_entry() -> RunEntry {
+        serde_json::from_value(serde_json::json!({
+            "run_id": "run-1",
+            "user_message_id": "u1",
+            "user_message": "hi",
+            "started_at": 0,
+            "status": "completed"
+        }))
+        .expect("test RunEntry")
+    }
+
+    #[test]
+    fn parse_codex_run_dedupes_snapshot_and_live_ids_for_same_text() {
+        // Live notifications use real ids (msg_…); crash-recovery snapshots
+        // renumber the same items to synthetic item-N ids. The parser must
+        // render the item once.
+        let run = test_run_entry();
+        let lines = vec![
+            r#"{"type":"item.completed","item":{"id":"msg_abc","type":"agent_message","text":"Hello"}}"#.to_string(),
+            r#"{"type":"item.completed","item":{"id":"item-2","type":"agent_message","text":"Hello"}}"#.to_string(),
+            r#"{"type":"item.completed","item":{"id":"rs_abc","type":"reasoning","text":"thinking…"}}"#.to_string(),
+            r#"{"type":"item.completed","item":{"id":"item-1","type":"reasoning","text":"thinking…"}}"#.to_string(),
+        ];
+
+        let msg = parse_codex_run_to_message(&lines, &run).expect("parse");
+        assert_eq!(msg.content, "Hello");
+        let text_blocks = msg
+            .content_blocks
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::Text { .. }))
+            .count();
+        let thinking_blocks = msg
+            .content_blocks
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::Thinking { .. }))
+            .count();
+        assert_eq!(text_blocks, 1);
+        assert_eq!(thinking_blocks, 1);
+    }
+
+    #[test]
+    fn parse_codex_run_keeps_repeated_text_from_distinct_real_ids() {
+        let run = test_run_entry();
+        let lines = vec![
+            r#"{"type":"item.completed","item":{"id":"msg_a","type":"agent_message","text":"Done."}}"#.to_string(),
+            r#"{"type":"item.completed","item":{"id":"msg_b","type":"agent_message","text":"Done."}}"#.to_string(),
+        ];
+
+        let msg = parse_codex_run_to_message(&lines, &run).expect("parse");
+        assert_eq!(msg.content, "Done.Done.");
+    }
+
+    #[test]
+    fn snapshot_append_skips_text_items_already_written_under_live_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_file = tmp.path().join("run.jsonl");
+        std::fs::write(
+            &output_file,
+            concat!(
+                r#"{"type":"item.completed","item":{"id":"msg_abc","type":"agent_message","text":"Hello"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let response = serde_json::json!({
+            "thread": {
+                "status": { "type": "active" },
+                "turns": [
+                    {
+                        "id": "turn-1",
+                        "status": "inProgress",
+                        "items": [
+                            { "id": "item-2", "type": "agentMessage", "text": "Hello" },
+                            { "id": "item-3", "type": "agentMessage", "text": "New content" }
+                        ]
+                    }
+                ]
+            }
+        });
+
+        append_codex_thread_snapshot_to_history_file(
+            &output_file,
+            &response,
+            Some("turn-1"),
+            false,
+        )
+        .expect("append");
+
+        let contents = std::fs::read_to_string(&output_file).unwrap();
+        assert_eq!(
+            contents.matches("\"text\":\"Hello\"").count(),
+            1,
+            "duplicate snapshot of live-written item must be skipped: {contents}"
+        );
+        assert!(contents.contains("New content"));
+    }
+
+    #[test]
+    fn snapshot_history_lines_match_live_notification_lines_byte_for_byte() {
+        // The resume backfill relies on exact-line dedupe between snapshot
+        // lines (thread/resume) and live lines (item/completed notifications).
+        // Both must serialize identically for the same item.
+        let item = serde_json::json!({
+            "id": "msg-1",
+            "type": "agentMessage",
+            "text": "done"
+        });
+
+        let live_params = serde_json::json!({ "item": item });
+        let live_line = notification_to_history_line("item/completed", &live_params)
+            .expect("live history line");
+
+        let response = serde_json::json!({
+            "thread": {
+                "status": { "type": "active" },
+                "turns": [
+                    {
+                        "id": "turn-1",
+                        "status": "inProgress",
+                        "items": [item]
+                    }
+                ]
+            }
+        });
+        let snapshot_lines = codex_thread_snapshot_history_lines(&response, Some("turn-1"), false);
+
+        assert!(
+            snapshot_lines.contains(&live_line),
+            "snapshot lines {snapshot_lines:?} must contain live line {live_line}"
+        );
     }
 
     #[test]
@@ -4294,6 +4741,8 @@ mod tests {
             execution_mode: Some("plan".to_string()),
             thinking_level: None,
             effort_level: None,
+            backend: None,
+            custom_profile_name: None,
             started_at: 1,
             ended_at: Some(2),
             status: RunStatus::Cancelled,
@@ -4306,6 +4755,7 @@ mod tests {
             codex_thread_id: None,
             codex_turn_id: None,
             cursor_chat_id: None,
+            grok_session_id: None,
         };
 
         let message = parse_codex_run_to_message(&lines, &run).expect("message");
@@ -4316,6 +4766,71 @@ mod tests {
             message.content_blocks.first(),
             Some(ContentBlock::Text { text }) if text == "Same text"
         ));
+    }
+
+    #[test]
+    fn build_turn_steer_params_shape() {
+        let params = build_turn_steer_params("thread-1", "turn-1", "do this next");
+
+        assert_eq!(params["threadId"], "thread-1");
+        assert_eq!(params["expectedTurnId"], "turn-1");
+        let input = params["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "text");
+        assert_eq!(input[0]["text"], "do this next");
+    }
+
+    #[test]
+    fn parse_run_orders_steered_user_message_between_items() {
+        let lines = vec![
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"Before steer"}}"#
+                .to_string(),
+            r#"{"type":"steered_user_message","text":"also check tests"}"#.to_string(),
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"After steer"}}"#
+                .to_string(),
+        ];
+        let run = RunEntry {
+            run_id: "run-3".to_string(),
+            user_message_id: "user-3".to_string(),
+            user_message: "prompt".to_string(),
+            model: None,
+            execution_mode: Some("build".to_string()),
+            thinking_level: None,
+            effort_level: None,
+            backend: None,
+            custom_profile_name: None,
+            started_at: 1,
+            ended_at: Some(2),
+            status: RunStatus::Completed,
+            assistant_message_id: Some("assistant-3".to_string()),
+            cancelled: false,
+            recovered: false,
+            claude_session_id: None,
+            pid: None,
+            usage: None,
+            codex_thread_id: None,
+            codex_turn_id: None,
+            cursor_chat_id: None,
+            grok_session_id: None,
+        };
+
+        let message = parse_codex_run_to_message(&lines, &run).expect("message");
+
+        assert_eq!(message.content_blocks.len(), 3);
+        assert!(matches!(
+            &message.content_blocks[0],
+            ContentBlock::Text { text } if text == "Before steer"
+        ));
+        assert!(matches!(
+            &message.content_blocks[1],
+            ContentBlock::UserInput { text } if text == "also check tests"
+        ));
+        assert!(matches!(
+            &message.content_blocks[2],
+            ContentBlock::Text { text } if text == "After steer"
+        ));
+        // Steered text must not leak into the assistant content blob.
+        assert!(!message.content.contains("also check tests"));
     }
 
     #[test]
@@ -4335,6 +4850,8 @@ mod tests {
             execution_mode: Some("plan".to_string()),
             thinking_level: None,
             effort_level: None,
+            backend: None,
+            custom_profile_name: None,
             started_at: 1,
             ended_at: Some(2),
             status: RunStatus::Completed,
@@ -4347,6 +4864,7 @@ mod tests {
             codex_thread_id: None,
             codex_turn_id: None,
             cursor_chat_id: None,
+            grok_session_id: None,
         };
 
         let message = parse_codex_run_to_message(&lines, &run).expect("message");
@@ -4388,6 +4906,8 @@ mod tests {
             execution_mode: Some("plan".to_string()),
             thinking_level: None,
             effort_level: None,
+            backend: None,
+            custom_profile_name: None,
             started_at: 1,
             ended_at: Some(2),
             status: RunStatus::Completed,
@@ -4400,6 +4920,7 @@ mod tests {
             codex_thread_id: None,
             codex_turn_id: None,
             cursor_chat_id: None,
+            grok_session_id: None,
         };
 
         let message = parse_codex_run_to_message(&lines, &run).expect("message");
@@ -4430,6 +4951,30 @@ mod tests {
     }
 
     #[test]
+    fn codex_run_log_visible_artifacts_detects_cancelled_tool_output_without_agent_id() {
+        let lines = vec![
+            r#"{"_run_meta":true}"#.to_string(),
+            r#"{"type":"turn.started"}"#.to_string(),
+            r#"{"item":{"aggregated_output":null,"command":"rtk test","id":"call-1","status":"inProgress","type":"command_execution"},"type":"item.started"}"#.to_string(),
+        ];
+
+        assert!(codex_run_log_has_visible_assistant_artifacts(&lines, false));
+    }
+
+    #[test]
+    fn codex_run_log_visible_artifacts_ignores_user_only_cancelled_run() {
+        let lines = vec![
+            r#"{"_run_meta":true}"#.to_string(),
+            r#"{"type":"turn.started"}"#.to_string(),
+            r#"{"item":{"content":[{"text":"continue","type":"text"}],"id":"user-1","type":"user_message"},"type":"item.completed"}"#.to_string(),
+        ];
+
+        assert!(!codex_run_log_has_visible_assistant_artifacts(
+            &lines, false
+        ));
+    }
+
+    #[test]
     fn extract_plain_text_plan_sections_splits_intro_from_plan() {
         assert_eq!(
             extract_plain_text_plan_sections(
@@ -4456,6 +5001,8 @@ mod tests {
             execution_mode: Some("plan".to_string()),
             thinking_level: None,
             effort_level: None,
+            backend: None,
+            custom_profile_name: None,
             started_at: 1,
             ended_at: Some(2),
             status: RunStatus::Completed,
@@ -4468,6 +5015,7 @@ mod tests {
             codex_thread_id: None,
             codex_turn_id: None,
             cursor_chat_id: None,
+            grok_session_id: None,
         };
 
         let message = parse_codex_run_to_message(&lines, &run).expect("message");
@@ -4509,6 +5057,8 @@ mod tests {
             execution_mode: Some("yolo".to_string()),
             thinking_level: None,
             effort_level: None,
+            backend: None,
+            custom_profile_name: None,
             started_at: 1,
             ended_at: Some(2),
             status: RunStatus::Completed,
@@ -4521,6 +5071,7 @@ mod tests {
             codex_thread_id: None,
             codex_turn_id: None,
             cursor_chat_id: None,
+            grok_session_id: None,
         };
 
         let message = parse_codex_run_to_message(&lines, &run).expect("message");
@@ -4567,6 +5118,8 @@ mod tests {
             execution_mode: Some("plan".to_string()),
             thinking_level: None,
             effort_level: None,
+            backend: None,
+            custom_profile_name: None,
             started_at: 1,
             ended_at: Some(2),
             status: RunStatus::Completed,
@@ -4579,6 +5132,7 @@ mod tests {
             codex_thread_id: None,
             codex_turn_id: None,
             cursor_chat_id: None,
+            grok_session_id: None,
         };
 
         let message = parse_codex_run_to_message(&lines, &run).expect("message");
@@ -4606,6 +5160,8 @@ mod tests {
             execution_mode: Some("plan".to_string()),
             thinking_level: None,
             effort_level: None,
+            backend: None,
+            custom_profile_name: None,
             started_at: 1,
             ended_at: Some(2),
             status: RunStatus::Completed,
@@ -4618,6 +5174,7 @@ mod tests {
             codex_thread_id: None,
             codex_turn_id: None,
             cursor_chat_id: None,
+            grok_session_id: None,
         };
 
         let message = parse_codex_run_to_message(&lines, &run).expect("message");

@@ -4,6 +4,21 @@ interface ResolveApprovalLabelOptions {
   forceModeOverride?: boolean
 }
 
+const BACKEND_LABELS: Record<string, string> = {
+  claude: 'Claude',
+  codex: 'Codex',
+  opencode: 'OpenCode',
+  cursor: 'Cursor',
+  commandcode: 'CommandCode',
+}
+
+function formatBackendLabel(backend: string): string {
+  return (
+    BACKEND_LABELS[backend] ??
+    backend.charAt(0).toUpperCase() + backend.slice(1)
+  )
+}
+
 /**
  * Resolves a human-readable label for the backend + model that will be used
  * when approving a plan in build or yolo mode.
@@ -20,6 +35,7 @@ export function resolveApprovalLabel(
         selected_codex_model?: string | null
         selected_opencode_model?: string | null
         selected_cursor_model?: string | null
+        selected_commandcode_model?: string | null
         default_backend?: string | null
       }
     | undefined,
@@ -46,16 +62,17 @@ export function resolveApprovalLabel(
     resolvedBackend === 'codex'
       ? (preferences.selected_codex_model ?? 'gpt-5.5')
       : resolvedBackend === 'opencode'
-        ? (preferences.selected_opencode_model ?? 'opencode/gpt-5.3-codex')
+        ? (preferences.selected_opencode_model ?? 'opencode/gpt-5.5')
         : resolvedBackend === 'cursor'
           ? (preferences.selected_cursor_model ?? 'cursor/auto')
-          : (preferences.selected_model ?? null)
+          : resolvedBackend === 'commandcode'
+            ? (preferences.selected_commandcode_model ?? 'commandcode/default')
+            : (preferences.selected_model ?? null)
   const resolvedModel = model ?? backendDefaultModel
   if (!resolvedModel && !resolvedBackend) return null
   const modelLabel = resolvedModel ? getMessageModelLabel(resolvedModel) : null
   const parts: string[] = []
-  if (resolvedBackend && resolvedBackend !== 'claude')
-    parts.push(resolvedBackend)
+  if (resolvedBackend) parts.push(formatBackendLabel(resolvedBackend))
   if (modelLabel) parts.push(modelLabel)
   return parts.length > 0 ? parts.join(' · ') : null
 }

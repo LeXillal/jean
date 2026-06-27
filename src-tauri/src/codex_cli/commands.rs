@@ -10,6 +10,7 @@ use tauri::AppHandle;
 use super::config::{ensure_cli_dir, get_cli_binary_path, get_cli_dir, resolve_cli_binary};
 use crate::gh_cli::resolve_github_api_token;
 use crate::http_server::EmitExt;
+#[cfg(target_os = "macos")]
 use crate::platform::silent_command;
 
 /// GitHub API URL for Codex CLI releases
@@ -82,6 +83,7 @@ pub struct CodexUsageSnapshot {
     pub weekly: Option<CodexUsageWindowSnapshot>,
     pub reviews: Option<CodexUsageWindowSnapshot>,
     pub credits_remaining: Option<f64>,
+    pub rate_limit_reached_type: Option<String>,
     pub model_limits: Vec<CodexAdditionalUsageLimit>,
     pub fetched_at: u64,
 }
@@ -133,6 +135,19 @@ struct GitHubRelease {
 struct GitHubAsset {
     name: String,
     browser_download_url: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexArchiveFormat {
+    TarGz,
+    Zip,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexAssetCandidate {
+    name: String,
+    binary_target: String,
+    format: CodexArchiveFormat,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -227,6 +242,45 @@ struct CodexUsageApiResponse {
     additional_rate_limits: Option<Vec<CodexUsageAdditionalRateLimit>>,
     #[serde(default)]
     credits: Option<CodexCredits>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexAppServerRateLimitsParams {
+    rate_limits: CodexAppServerRateLimitSnapshot,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexAppServerRateLimitSnapshot {
+    #[serde(default)]
+    plan_type: Option<String>,
+    #[serde(default)]
+    primary: Option<CodexAppServerRateLimitWindow>,
+    #[serde(default)]
+    secondary: Option<CodexAppServerRateLimitWindow>,
+    #[serde(default)]
+    credits: Option<CodexAppServerCredits>,
+    #[serde(default)]
+    rate_limit_reached_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexAppServerRateLimitWindow {
+    #[serde(default, deserialize_with = "de_opt_f64")]
+    used_percent: Option<f64>,
+    #[serde(default, deserialize_with = "de_opt_u64")]
+    resets_at: Option<u64>,
+    #[serde(default, deserialize_with = "de_opt_u64")]
+    window_duration_mins: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexAppServerCredits {
+    #[serde(default, deserialize_with = "de_opt_f64")]
+    balance: Option<f64>,
 }
 
 fn de_opt_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
@@ -664,6 +718,58 @@ fn map_usage_window(
     })
 }
 
+fn current_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn map_app_server_rate_limit_window(
+    window: Option<CodexAppServerRateLimitWindow>,
+) -> Option<CodexUsageWindowSnapshot> {
+    let window = window?;
+    let used_percent = window.used_percent?;
+
+    Some(CodexUsageWindowSnapshot {
+        used_percent,
+        resets_at: window.resets_at,
+        limit_window_seconds: window
+            .window_duration_mins
+            .map(|mins| mins.saturating_mul(60)),
+    })
+}
+
+pub(crate) fn codex_usage_snapshot_from_app_server_rate_limits(
+    params: &Value,
+    fetched_at: u64,
+) -> Result<CodexUsageSnapshot, String> {
+    let notification = serde_json::from_value::<CodexAppServerRateLimitsParams>(params.clone())
+        .map_err(|e| format!("Failed to parse Codex rate limits notification payload: {e}"))?;
+    let rate_limits = notification.rate_limits;
+
+    Ok(CodexUsageSnapshot {
+        plan_type: rate_limits.plan_type,
+        session: map_app_server_rate_limit_window(rate_limits.primary),
+        weekly: map_app_server_rate_limit_window(rate_limits.secondary),
+        reviews: None,
+        credits_remaining: rate_limits.credits.and_then(|credits| credits.balance),
+        rate_limit_reached_type: rate_limits.rate_limit_reached_type,
+        model_limits: Vec::new(),
+        fetched_at,
+    })
+}
+
+pub(crate) fn update_codex_usage_from_app_server_rate_limits(
+    app: &AppHandle,
+    params: &Value,
+) -> Result<CodexUsageSnapshot, String> {
+    let snapshot = codex_usage_snapshot_from_app_server_rate_limits(params, current_unix_secs())?;
+    save_cached_codex_usage(&snapshot, snapshot.fetched_at);
+    let _ = app.emit_all("codex-cli:usage-updated", &snapshot);
+    Ok(snapshot)
+}
+
 async fn refresh_codex_access_token(
     client: &reqwest::Client,
     auth_source: &CodexAuthSource,
@@ -859,7 +965,10 @@ pub async fn check_codex_cli_installed(app: AppHandle) -> Result<CodexCliStatus,
     }
 
     // Get version
-    let version = match silent_command(&binary_path).arg("--version").output() {
+    let version = match crate::platform::cli_command(&binary_path.to_string_lossy(), None)
+        .arg("--version")
+        .output()
+    {
         Ok(output) if output.status.success() => {
             let version_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
             log::debug!(
@@ -966,10 +1075,7 @@ pub async fn check_codex_cli_auth(app: AppHandle) -> Result<CodexAuthStatus, Str
 /// Get current Codex usage for authenticated users.
 #[tauri::command]
 pub async fn get_codex_usage(app: AppHandle) -> Result<CodexUsageSnapshot, String> {
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now_secs = current_unix_secs();
     if let Some(cached) = load_cached_codex_usage(now_secs) {
         return Ok(cached);
     }
@@ -1148,6 +1254,7 @@ pub async fn get_codex_usage(app: AppHandle) -> Result<CodexUsageSnapshot, Strin
         weekly,
         reviews,
         credits_remaining,
+        rate_limit_reached_type: None,
         model_limits,
         fetched_at: now_secs,
     };
@@ -1263,9 +1370,21 @@ async fn fetch_codex_versions_from_api(app: &AppHandle) -> Result<Vec<CodexRelea
         .await
         .map_err(|e| format!("Failed to parse GitHub API response: {e}"))?;
 
-    let versions: Vec<CodexReleaseInfo> = releases
+    let target = resolve_codex_runtime_target()?;
+    let asset_names = codex_asset_name_candidates(target);
+    let versions = codex_versions_from_releases(releases, &asset_names);
+
+    log::trace!("Found {} Codex CLI versions from API", versions.len());
+    Ok(versions)
+}
+
+fn codex_versions_from_releases(
+    releases: Vec<GitHubRelease>,
+    asset_names: &[String],
+) -> Vec<CodexReleaseInfo> {
+    releases
         .into_iter()
-        .filter(|r| !r.prerelease && !r.assets.is_empty())
+        .filter(|r| !r.prerelease && find_matching_asset_url(r, asset_names).is_some())
         .take(5)
         .map(|r| CodexReleaseInfo {
             version: extract_version_from_tag(&r.tag_name),
@@ -1273,10 +1392,7 @@ async fn fetch_codex_versions_from_api(app: &AppHandle) -> Result<Vec<CodexRelea
             published_at: r.published_at,
             prerelease: r.prerelease,
         })
-        .collect();
-
-    log::trace!("Found {} Codex CLI versions from API", versions.len());
-    Ok(versions)
+        .collect()
 }
 
 /// Get the Codex target triple for the current platform
@@ -1293,12 +1409,12 @@ fn get_codex_target() -> Result<&'static str, String> {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        return Ok("x86_64-unknown-linux-gnu");
+        return Ok("x86_64-unknown-linux-musl");
     }
 
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     {
-        return Ok("aarch64-unknown-linux-gnu");
+        return Ok("aarch64-unknown-linux-musl");
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -1313,6 +1429,56 @@ fn get_codex_target() -> Result<&'static str, String> {
 
     #[allow(unreachable_code)]
     Err("Unsupported platform".to_string())
+}
+
+fn resolve_codex_runtime_target() -> Result<&'static str, String> {
+    let wsl = crate::platform::get_wsl_config();
+    if wsl.enabled {
+        wsl_codex_target(&wsl.distro)
+    } else {
+        get_codex_target()
+    }
+}
+
+fn codex_asset_candidates(target: &str) -> Vec<CodexAssetCandidate> {
+    let tar_gz = |binary_target: &str| CodexAssetCandidate {
+        name: format!("codex-{binary_target}.tar.gz"),
+        binary_target: binary_target.to_string(),
+        format: CodexArchiveFormat::TarGz,
+    };
+    let zip = |binary_target: &str| CodexAssetCandidate {
+        name: format!("codex-{binary_target}.exe.zip"),
+        binary_target: binary_target.to_string(),
+        format: CodexArchiveFormat::Zip,
+    };
+
+    match target {
+        "x86_64-unknown-linux-musl" => vec![
+            tar_gz("x86_64-unknown-linux-musl"),
+            tar_gz("x86_64-unknown-linux-gnu"),
+        ],
+        "aarch64-unknown-linux-musl" => vec![
+            tar_gz("aarch64-unknown-linux-musl"),
+            tar_gz("aarch64-unknown-linux-gnu"),
+        ],
+        "x86_64-unknown-linux-gnu" => vec![
+            tar_gz("x86_64-unknown-linux-gnu"),
+            tar_gz("x86_64-unknown-linux-musl"),
+        ],
+        "aarch64-unknown-linux-gnu" => vec![
+            tar_gz("aarch64-unknown-linux-gnu"),
+            tar_gz("aarch64-unknown-linux-musl"),
+        ],
+        "x86_64-pc-windows-msvc" | "aarch64-pc-windows-msvc" => vec![zip(target)],
+        _ => vec![tar_gz(target)],
+    }
+}
+
+fn codex_asset_name_candidates(target: &str) -> Vec<String> {
+    codex_asset_candidates(target)
+        .into_iter()
+        .map(|candidate| candidate.name)
+        .collect()
 }
 
 /// Fetch the latest Codex CLI version from GitHub API.
@@ -1338,8 +1504,9 @@ async fn fetch_latest_codex_version(app: &AppHandle) -> Result<String, String> {
     if let Ok(resp) = request.send().await {
         if resp.status().is_success() {
             if let Ok(releases) = resp.json::<Vec<GitHubRelease>>().await {
-                if let Some(release) = releases.first() {
-                    let version = extract_version_from_tag(&release.tag_name);
+                let target = resolve_codex_runtime_target()?;
+                let asset_names = codex_asset_name_candidates(target);
+                if let Some(version) = latest_codex_version_from_releases(releases, &asset_names) {
                     log::trace!("Latest Codex CLI version: {version}");
                     return Ok(version);
                 }
@@ -1356,12 +1523,22 @@ async fn fetch_latest_codex_version(app: &AppHandle) -> Result<String, String> {
     Ok(FALLBACK_CODEX_VERSION.to_string())
 }
 
+fn latest_codex_version_from_releases(
+    releases: Vec<GitHubRelease>,
+    asset_names: &[String],
+) -> Option<String> {
+    releases
+        .into_iter()
+        .find(|release| find_matching_asset_url(release, asset_names).is_some())
+        .map(|release| extract_version_from_tag(&release.tag_name))
+}
+
 /// Find the download URL for a specific asset by searching recent releases
 async fn find_asset_url(
     app: &AppHandle,
     version: &str,
-    asset_name: &str,
-) -> Result<String, String> {
+    candidates: &[CodexAssetCandidate],
+) -> Result<(String, CodexAssetCandidate), String> {
     let client = build_github_client()?;
     let token = resolve_github_api_token(app);
     let mut request = client
@@ -1388,13 +1565,16 @@ async fn find_asset_url(
     for release in &releases {
         let release_version = extract_version_from_tag(&release.tag_name);
         if release_version == version {
-            for asset in &release.assets {
-                if asset.name == asset_name {
-                    return Ok(asset.browser_download_url.clone());
-                }
+            if let Some((url, candidate)) = find_matching_candidate_asset(release, candidates) {
+                return Ok((url, candidate));
             }
+            let asset_names: Vec<&str> = candidates
+                .iter()
+                .map(|candidate| candidate.name.as_str())
+                .collect();
             return Err(format!(
-                "Asset {asset_name} not found in release {}",
+                "Assets [{}] not found in release {}",
+                asset_names.join(", "),
                 release.tag_name
             ));
         }
@@ -1403,11 +1583,47 @@ async fn find_asset_url(
     Err(format!("Release for version {version} not found"))
 }
 
+fn find_matching_candidate_asset(
+    release: &GitHubRelease,
+    candidates: &[CodexAssetCandidate],
+) -> Option<(String, CodexAssetCandidate)> {
+    for candidate in candidates {
+        for asset in &release.assets {
+            if asset.name == candidate.name {
+                return Some((asset.browser_download_url.clone(), candidate.clone()));
+            }
+        }
+    }
+    None
+}
+
+fn find_matching_asset_url(release: &GitHubRelease, asset_names: &[String]) -> Option<String> {
+    for asset_name in asset_names {
+        for asset in &release.assets {
+            if asset.name == *asset_name {
+                return Some(asset.browser_download_url.clone());
+            }
+        }
+    }
+    None
+}
+
 /// Pick the codex target triple for a WSL distro given the host install.
 fn wsl_codex_target(distro: &str) -> Result<&'static str, String> {
-    match crate::platform::wsl_detect_arch(distro) {
-        Some("linux-x64") => Ok("x86_64-unknown-linux-gnu"),
-        Some("linux-arm64") => Ok("aarch64-unknown-linux-gnu"),
+    resolve_codex_runtime_target_for_wsl_arch(true, crate::platform::wsl_detect_arch(distro))
+}
+
+fn resolve_codex_runtime_target_for_wsl_arch(
+    wsl_enabled: bool,
+    wsl_arch: Option<&str>,
+) -> Result<&'static str, String> {
+    if !wsl_enabled {
+        return get_codex_target();
+    }
+
+    match wsl_arch {
+        Some("linux-x64") => Ok("x86_64-unknown-linux-musl"),
+        Some("linux-arm64") => Ok("aarch64-unknown-linux-musl"),
         _ => Err("Unsupported WSL architecture (expected x86_64 or aarch64)".to_string()),
     }
 }
@@ -1429,23 +1645,13 @@ pub async fn install_codex_cli(app: AppHandle, version: Option<String>) -> Resul
     };
 
     // Target triple differs for native host vs WSL.
-    let target: &str = if wsl.enabled {
-        wsl_codex_target(&wsl.distro)?
-    } else {
-        get_codex_target()?
-    };
+    let target: &str = resolve_codex_runtime_target()?;
     log::trace!("Installing version {version} for target {target}");
 
-    // Release assets: zip on Windows targets, tar.gz everywhere else.
-    let is_zip = target.contains("windows");
-    let asset_name = if is_zip {
-        format!("codex-{target}.exe.zip")
-    } else {
-        format!("codex-{target}.tar.gz")
-    };
+    let candidates = codex_asset_candidates(target);
 
     // Find the download URL from the release assets
-    let download_url = find_asset_url(&app, &version, &asset_name).await?;
+    let (download_url, asset_candidate) = find_asset_url(&app, &version, &candidates).await?;
     log::trace!("Downloading from: {download_url}");
 
     // Emit progress: downloading
@@ -1481,10 +1687,13 @@ pub async fn install_codex_cli(app: AppHandle, version: Option<String>) -> Resul
     emit_progress(&app, "extracting", "Extracting archive...", 45);
 
     // Extract the binary bytes in-memory so native and WSL can share the flow.
-    let binary_bytes = if is_zip {
-        extract_zip_binary_bytes(&archive_content, target)?
-    } else {
-        extract_tar_gz_binary_bytes(&archive_content, target)?
+    let binary_bytes = match asset_candidate.format {
+        CodexArchiveFormat::Zip => {
+            extract_zip_binary_bytes(&archive_content, &asset_candidate.binary_target)?
+        }
+        CodexArchiveFormat::TarGz => {
+            extract_tar_gz_binary_bytes(&archive_content, &asset_candidate.binary_target)?
+        }
     };
 
     if wsl.enabled {
@@ -1551,7 +1760,7 @@ pub async fn install_codex_cli(app: AppHandle, version: Option<String>) -> Resul
     emit_progress(&app, "verifying", "Verifying installation...", 80);
 
     // Verify the binary works
-    let version_output = silent_command(&binary_path)
+    let version_output = crate::platform::cli_command(&binary_path.to_string_lossy(), None)
         .arg("--version")
         .output()
         .map_err(|e| format!("Failed to verify Codex CLI: {e}"))?;
@@ -1745,5 +1954,212 @@ mod tests {
                     .join("auth.json"),
             ]
         );
+    }
+
+    #[test]
+    fn codex_asset_candidates_use_musl_for_linux_x64() {
+        assert_eq!(
+            codex_asset_name_candidates("x86_64-unknown-linux-musl"),
+            vec![
+                "codex-x86_64-unknown-linux-musl.tar.gz".to_string(),
+                "codex-x86_64-unknown-linux-gnu.tar.gz".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_asset_candidates_use_musl_for_linux_arm64() {
+        assert_eq!(
+            codex_asset_name_candidates("aarch64-unknown-linux-musl"),
+            vec![
+                "codex-aarch64-unknown-linux-musl.tar.gz".to_string(),
+                "codex-aarch64-unknown-linux-gnu.tar.gz".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_release_asset_filter_accepts_matching_platform_asset_only() {
+        let releases = vec![
+            GitHubRelease {
+                tag_name: "rust-v0.130.0".to_string(),
+                published_at: "2026-05-08T23:09:55Z".to_string(),
+                prerelease: false,
+                assets: vec![GitHubAsset {
+                    name: "codex-x86_64-unknown-linux-musl.tar.gz".to_string(),
+                    browser_download_url: "https://example.com/codex-linux-musl.tar.gz".to_string(),
+                }],
+            },
+            GitHubRelease {
+                tag_name: "rust-v0.129.0".to_string(),
+                published_at: "2026-05-01T23:09:55Z".to_string(),
+                prerelease: false,
+                assets: vec![GitHubAsset {
+                    name: "codex-aarch64-apple-darwin.tar.gz".to_string(),
+                    browser_download_url: "https://example.com/codex-mac.tar.gz".to_string(),
+                }],
+            },
+        ];
+
+        let versions = codex_versions_from_releases(
+            releases,
+            &codex_asset_name_candidates("x86_64-unknown-linux-musl"),
+        );
+
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version, "0.130.0");
+        assert_eq!(versions[0].tag_name, "rust-v0.130.0");
+    }
+
+    #[test]
+    fn codex_release_asset_lookup_prefers_first_matching_candidate() {
+        let release = GitHubRelease {
+            tag_name: "rust-v0.130.0".to_string(),
+            published_at: "2026-05-08T23:09:55Z".to_string(),
+            prerelease: false,
+            assets: vec![
+                GitHubAsset {
+                    name: "codex-x86_64-unknown-linux-gnu.tar.gz".to_string(),
+                    browser_download_url: "https://example.com/codex-linux-gnu.tar.gz".to_string(),
+                },
+                GitHubAsset {
+                    name: "codex-x86_64-unknown-linux-musl.tar.gz".to_string(),
+                    browser_download_url: "https://example.com/codex-linux-musl.tar.gz".to_string(),
+                },
+            ],
+        };
+
+        let url = find_matching_asset_url(
+            &release,
+            &codex_asset_name_candidates("x86_64-unknown-linux-musl"),
+        );
+
+        assert_eq!(
+            url,
+            Some("https://example.com/codex-linux-musl.tar.gz".to_string())
+        );
+    }
+
+    #[test]
+    fn latest_codex_version_skips_releases_without_platform_asset() {
+        let releases = vec![
+            GitHubRelease {
+                tag_name: "rust-v0.131.0".to_string(),
+                published_at: "2026-05-15T23:09:55Z".to_string(),
+                prerelease: false,
+                assets: vec![GitHubAsset {
+                    name: "codex-aarch64-apple-darwin.tar.gz".to_string(),
+                    browser_download_url: "https://example.com/codex-mac.tar.gz".to_string(),
+                }],
+            },
+            GitHubRelease {
+                tag_name: "rust-v0.130.0".to_string(),
+                published_at: "2026-05-08T23:09:55Z".to_string(),
+                prerelease: false,
+                assets: vec![GitHubAsset {
+                    name: "codex-x86_64-unknown-linux-musl.tar.gz".to_string(),
+                    browser_download_url: "https://example.com/codex-linux-musl.tar.gz".to_string(),
+                }],
+            },
+        ];
+
+        let version = latest_codex_version_from_releases(
+            releases,
+            &codex_asset_name_candidates("x86_64-unknown-linux-musl"),
+        );
+
+        assert_eq!(version, Some("0.130.0".to_string()));
+    }
+
+    #[test]
+    fn latest_codex_version_uses_wsl_linux_target_for_asset_filtering() {
+        let releases = vec![
+            GitHubRelease {
+                tag_name: "rust-v0.131.0".to_string(),
+                published_at: "2026-05-15T23:09:55Z".to_string(),
+                prerelease: false,
+                assets: vec![GitHubAsset {
+                    name: "codex-x86_64-pc-windows-msvc.exe.zip".to_string(),
+                    browser_download_url: "https://example.com/codex-windows.zip".to_string(),
+                }],
+            },
+            GitHubRelease {
+                tag_name: "rust-v0.130.0".to_string(),
+                published_at: "2026-05-08T23:09:55Z".to_string(),
+                prerelease: false,
+                assets: vec![GitHubAsset {
+                    name: "codex-x86_64-unknown-linux-musl.tar.gz".to_string(),
+                    browser_download_url: "https://example.com/codex-linux-musl.tar.gz".to_string(),
+                }],
+            },
+        ];
+
+        let target = resolve_codex_runtime_target_for_wsl_arch(true, Some("linux-x64")).unwrap();
+        let version =
+            latest_codex_version_from_releases(releases, &codex_asset_name_candidates(target));
+
+        assert_eq!(target, "x86_64-unknown-linux-musl");
+        assert_eq!(version, Some("0.130.0".to_string()));
+    }
+
+    #[test]
+    fn app_server_rate_limits_map_to_usage_snapshot() {
+        let params = serde_json::json!({
+            "rateLimits": {
+                "limitId": "codex",
+                "limitName": null,
+                "primary": {
+                    "usedPercent": 23,
+                    "windowDurationMins": 300,
+                    "resetsAt": 1_771_456_509
+                },
+                "secondary": {
+                    "usedPercent": 15,
+                    "windowDurationMins": 10080,
+                    "resetsAt": 1_772_023_891
+                },
+                "credits": {
+                    "hasCredits": true,
+                    "unlimited": false,
+                    "balance": "12.5"
+                },
+                "planType": "plus",
+                "rateLimitReachedType": "rate_limit_reached"
+            }
+        });
+
+        let snapshot = codex_usage_snapshot_from_app_server_rate_limits(&params, 1_771_450_000)
+            .expect("rate limits snapshot should parse");
+
+        assert_eq!(snapshot.plan_type.as_deref(), Some("plus"));
+        assert_eq!(
+            snapshot.session.as_ref().map(|w| w.used_percent),
+            Some(23.0)
+        );
+        assert_eq!(
+            snapshot.session.as_ref().and_then(|w| w.resets_at),
+            Some(1_771_456_509)
+        );
+        assert_eq!(
+            snapshot
+                .session
+                .as_ref()
+                .and_then(|w| w.limit_window_seconds),
+            Some(18_000)
+        );
+        assert_eq!(snapshot.weekly.as_ref().map(|w| w.used_percent), Some(15.0));
+        assert_eq!(
+            snapshot
+                .weekly
+                .as_ref()
+                .and_then(|w| w.limit_window_seconds),
+            Some(604_800)
+        );
+        assert_eq!(snapshot.credits_remaining, Some(12.5));
+        assert_eq!(
+            snapshot.rate_limit_reached_type.as_deref(),
+            Some("rate_limit_reached")
+        );
+        assert_eq!(snapshot.fetched_at, 1_771_450_000);
     }
 }

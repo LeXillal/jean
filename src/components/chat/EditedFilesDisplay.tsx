@@ -1,5 +1,6 @@
-import { memo, useMemo } from 'react'
-import type { ToolCall } from '@/types/chat'
+import { memo, useMemo, useState } from 'react'
+import { diffLines } from 'diff'
+import type { ToolCall, ChatMessage } from '@/types/chat'
 import { Badge } from '@/components/ui/badge'
 import { getFilename } from '@/lib/path-utils'
 import {
@@ -7,18 +8,12 @@ import {
   TooltipTrigger,
   TooltipContent,
 } from '@/components/ui/tooltip'
-import type { FileEdit } from './FileEditsDiffModal'
+import { MessageDiffModal } from './MessageDiffModal'
+import type { EditTool } from './MessageDiffModal'
 
-interface EditInput {
-  file_path: string
-  old_string?: string
-  new_string?: string
-}
-
-/** Type guard: ToolCall is a Claude Edit with file_path. */
 function isEditTool(
   toolCall: ToolCall
-): toolCall is ToolCall & { input: EditInput } {
+): toolCall is ToolCall & { input: EditTool['input'] } {
   return (
     toolCall.name === 'Edit' &&
     typeof toolCall.input === 'object' &&
@@ -28,39 +23,158 @@ function isEditTool(
   )
 }
 
-interface EditedFilesDisplayProps {
-  toolCalls: ToolCall[] | undefined
-  onFileClick: (path: string, edits: FileEdit[]) => void
+interface CodexFileChange {
+  path: string
+  diff?: string
 }
 
-/**
- * Display edited files at the bottom of assistant messages.
- * Collects all Edit tool calls and shows unique file paths as clickable pills.
- * Clicking a pill opens the diff modal with every edit applied to that file
- * during this turn (in order).
- */
+function getCodexFileChanges(toolCall: ToolCall): CodexFileChange[] {
+  if (toolCall.name !== 'FileChange') return []
+  const input = toolCall.input
+  if (!Array.isArray(input)) return []
+  return input.filter(
+    (change): change is CodexFileChange =>
+      typeof change === 'object' &&
+      change !== null &&
+      typeof (change as Record<string, unknown>).path === 'string'
+  )
+}
+
+function computeEditStats(
+  oldStr: string | undefined,
+  newStr: string | undefined
+): { additions: number; deletions: number } {
+  const changes = diffLines(oldStr ?? '', newStr ?? '')
+  let additions = 0
+  let deletions = 0
+  for (const part of changes) {
+    const count = part.count ?? 0
+    if (part.added) additions += count
+    else if (part.removed) deletions += count
+  }
+  return { additions, deletions }
+}
+
+function computeUnifiedDiffStats(diff: string | undefined): {
+  additions: number
+  deletions: number
+} {
+  let additions = 0
+  let deletions = 0
+  for (const line of (diff ?? '').split('\n')) {
+    if (line.startsWith('+++') || line.startsWith('---')) continue
+    if (line.startsWith('+')) additions += 1
+    else if (line.startsWith('-')) deletions += 1
+  }
+  return { additions, deletions }
+}
+
+function codexDiffToPatch(
+  filePath: string,
+  diff: string | undefined
+): string | null {
+  if (!diff) return null
+  if (diff.startsWith('diff --git ') || diff.startsWith('--- ')) return diff
+  return `Index: ${filePath}\n===================================================================\n--- ${filePath}\n+++ ${filePath}\n${diff}`
+}
+
+interface EditedFilesDisplayProps {
+  toolCalls: ToolCall[] | undefined
+  worktreePath?: string
+  /**
+   * Stable accessor for the full session message list. Used to compute
+   * "subsequent edits" lazily when the user opens a diff. Passing a stable
+   * function (rather than the `messages` array itself) keeps the memoized
+   * row from re-rendering whenever the session's message array identity
+   * changes — avoiding a per-row render cascade while scrolling.
+   */
+  getMessages?: () => ChatMessage[]
+  messageIndex?: number
+}
+
 export const EditedFilesDisplay = memo(function EditedFilesDisplay({
   toolCalls,
-  onFileClick,
+  worktreePath,
+  getMessages,
+  messageIndex,
 }: EditedFilesDisplayProps) {
-  const editsByPath = useMemo(() => {
-    const map = new Map<string, FileEdit[]>()
-    if (!toolCalls) return map
-    for (const tc of toolCalls) {
-      if (!isEditTool(tc)) continue
-      const list = map.get(tc.input.file_path) ?? []
-      list.push({
-        oldString: tc.input.old_string ?? '',
-        newString: tc.input.new_string ?? '',
+  const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null)
+
+  const editTools = useMemo(
+    () => (toolCalls ?? []).filter(isEditTool),
+    [toolCalls]
+  )
+
+  const codexChanges = useMemo(
+    () => (toolCalls ?? []).flatMap(getCodexFileChanges),
+    [toolCalls]
+  )
+
+  const uniqueFilePaths = useMemo(
+    () =>
+      Array.from(
+        new Set([
+          ...editTools.map(t => t.input.file_path),
+          ...codexChanges.map(change => change.path),
+        ])
+      ),
+    [editTools, codexChanges]
+  )
+
+  const fileStats = useMemo(() => {
+    const map = new Map<string, { additions: number; deletions: number }>()
+    const addStats = (
+      filePath: string,
+      delta: { additions: number; deletions: number }
+    ) => {
+      const prev = map.get(filePath) ?? { additions: 0, deletions: 0 }
+      map.set(filePath, {
+        additions: prev.additions + delta.additions,
+        deletions: prev.deletions + delta.deletions,
       })
-      map.set(tc.input.file_path, list)
+    }
+
+    for (const tool of editTools) {
+      addStats(
+        tool.input.file_path,
+        computeEditStats(tool.input.old_string, tool.input.new_string)
+      )
+    }
+    for (const change of codexChanges) {
+      addStats(change.path, computeUnifiedDiffStats(change.diff))
     }
     return map
-  }, [toolCalls])
+  }, [editTools, codexChanges])
 
-  if (editsByPath.size === 0) return null
+  const selectedEdits = useMemo(
+    () =>
+      selectedFilePath
+        ? editTools.filter(t => t.input.file_path === selectedFilePath)
+        : [],
+    [editTools, selectedFilePath]
+  )
 
-  const uniqueFilePaths = Array.from(editsByPath.keys())
+  const selectedCodexPatch = useMemo(() => {
+    if (!selectedFilePath) return null
+    const patches = codexChanges
+      .filter(change => change.path === selectedFilePath)
+      .map(change => codexDiffToPatch(change.path, change.diff))
+      .filter((patch): patch is string => Boolean(patch))
+    return patches.length > 0 ? patches.join('\n') : null
+  }, [codexChanges, selectedFilePath])
+
+  // All Edit tool calls on selectedFilePath from messages AFTER this one.
+  // Computed lazily — only once the user opens a diff — by pulling the
+  // current message list through the stable `getMessages` accessor.
+  const subsequentEdits = useMemo(() => {
+    if (!selectedFilePath || !getMessages || messageIndex == null) return []
+    return getMessages()
+      .slice(messageIndex + 1)
+      .flatMap(msg => (msg.tool_calls ?? []).filter(isEditTool))
+      .filter(t => t.input.file_path === selectedFilePath)
+  }, [selectedFilePath, getMessages, messageIndex])
+
+  if (uniqueFilePaths.length === 0) return null
 
   return (
     <div className="mt-2 flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground/70">
@@ -68,22 +182,46 @@ export const EditedFilesDisplay = memo(function EditedFilesDisplay({
         Edited {uniqueFilePaths.length} file
         {uniqueFilePaths.length === 1 ? '' : 's'}:
       </span>
-      {uniqueFilePaths.map(filePath => (
-        <Tooltip key={filePath}>
-          <TooltipTrigger asChild>
-            <Badge
-              variant="outline"
-              className="cursor-pointer"
-              onClick={() =>
-                onFileClick(filePath, editsByPath.get(filePath) ?? [])
-              }
-            >
-              {getFilename(filePath)}
-            </Badge>
-          </TooltipTrigger>
-          <TooltipContent>{filePath}</TooltipContent>
-        </Tooltip>
-      ))}
+
+      {uniqueFilePaths.map(filePath => {
+        const stats = fileStats.get(filePath)
+        return (
+          <Tooltip key={filePath}>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={() => setSelectedFilePath(filePath)}
+                aria-label={`View changes to ${getFilename(filePath)}`}
+                className="inline-flex rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <Badge variant="outline" className="cursor-pointer gap-1.5">
+                  {getFilename(filePath)}
+                  {stats && (stats.additions > 0 || stats.deletions > 0) && (
+                    <span className="flex items-center font-mono text-xs opacity-80">
+                      <span className="text-green-500">+{stats.additions}</span>
+                      <span className="text-muted-foreground mx-0.5">/</span>
+                      <span className="text-red-500">-{stats.deletions}</span>
+                    </span>
+                  )}
+                </Badge>
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>{filePath}</TooltipContent>
+          </Tooltip>
+        )
+      })}
+
+      {selectedFilePath && (
+        <MessageDiffModal
+          isOpen={true}
+          onClose={() => setSelectedFilePath(null)}
+          filePath={selectedFilePath}
+          edits={selectedEdits}
+          subsequentEdits={subsequentEdits}
+          worktreePath={worktreePath}
+          patch={selectedCodexPatch}
+        />
+      )}
     </div>
   )
 })

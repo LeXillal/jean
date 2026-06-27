@@ -21,6 +21,111 @@ fn wsl_shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// Spawn an arbitrary CLI as a fully detached background process (Unix).
+///
+/// Uses `nohup` and shell backgrounding so the process survives Jean quitting:
+/// stdin is /dev/null, stdout+stderr are appended to `log_file`.
+///
+/// Returns the PID of the detached process.
+#[cfg(unix)]
+pub fn spawn_detached_process(
+    cli_path: &Path,
+    args: &[String],
+    log_file: &Path,
+    working_dir: &Path,
+) -> Result<u32, String> {
+    let cli_path_escaped =
+        shell_escape(cli_path.to_str().ok_or("CLI path contains invalid UTF-8")?);
+    let log_path_escaped = shell_escape(
+        log_file
+            .to_str()
+            .ok_or("Log file path contains invalid UTF-8")?,
+    );
+
+    let args_str = args
+        .iter()
+        .map(|arg| shell_escape(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // `set -m` puts the background job in its own process group (pgid == pid)
+    // so kill_process_tree(pid) reaps the whole tree — important for CLIs that
+    // are node wrappers exec'ing a native child (e.g. codex). Without it the
+    // job inherits Jean's process group and a group kill would miss children
+    // (or hit Jean).
+    let shell_cmd = format!(
+        "set -m; nohup {cli_path_escaped} {args_str} </dev/null >> {log_path_escaped} 2>&1 & echo $!"
+    );
+
+    if !working_dir.exists() {
+        return Err(format!(
+            "Working directory does not exist: {}",
+            working_dir.display()
+        ));
+    }
+
+    log::trace!("Spawning detached process: {shell_cmd}");
+
+    let mut child = silent_command("sh")
+        .arg("-c")
+        .arg(&shell_cmd)
+        .current_dir(working_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn shell: {e}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("Failed to capture shell stdout")?;
+    let reader = BufReader::new(stdout);
+
+    let mut pid_str = String::new();
+    for line in reader.lines() {
+        match line {
+            Ok(l) => {
+                pid_str = l.trim().to_string();
+                break;
+            }
+            Err(e) => {
+                log::warn!("Error reading PID from shell: {e}");
+            }
+        }
+    }
+
+    let stderr_handle = child.stderr.take();
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("Failed to wait for shell: {e}"))?;
+
+    if !status.success() {
+        let stderr_output = stderr_handle
+            .map(|stderr| {
+                BufReader::new(stderr)
+                    .lines()
+                    .map_while(Result::ok)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+
+        return Err(format!(
+            "Shell command failed with status: {status}\nStderr: {stderr_output}"
+        ));
+    }
+
+    let pid: u32 = pid_str
+        .parse()
+        .map_err(|e| format!("Failed to parse PID '{pid_str}': {e}"))?;
+
+    log::trace!("Detached process spawned with PID: {pid}");
+
+    Ok(pid)
+}
+
 /// Spawn Claude CLI as a detached process that survives Jean quitting (Unix).
 ///
 /// Uses `nohup` and shell backgrounding to fully detach the process.
@@ -356,6 +461,28 @@ mod tests {
             wsl_shell_quote("/mnt/c/Users/O'Brien/input.jsonl"),
             "'/mnt/c/Users/O'\\''Brien/input.jsonl'"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_spawn_detached_process() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let log_file = tmp.path().join("out.log");
+
+        let pid = spawn_detached_process(
+            Path::new("/bin/sleep"),
+            &["30".to_string()],
+            &log_file,
+            tmp.path(),
+        )
+        .expect("spawn detached");
+
+        assert!(is_process_alive(pid));
+        // ppid should be 1 (or at least not us) once the shell exits, but the
+        // key property is it stays alive without us holding a Child handle.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
     }
 
     #[test]

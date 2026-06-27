@@ -135,6 +135,22 @@ export function UnreadBell({ title, hideTitle }: UnreadBellProps) {
     if (!open) setSnapshotItems(null)
   }, [open])
 
+  // Prune deleted sessions from the open snapshot. A session removed from the
+  // live ['all-sessions'] data (closed/archived/worktree deleted) is dropped,
+  // while a row that merely flipped status stays present in `entries` — so this
+  // does not reintroduce the mid-interaction yank the snapshot prevents.
+  useEffect(() => {
+    if (!open || !allSessions) return
+    const liveIds = new Set(
+      allSessions.entries.flatMap(e => e.sessions.map(s => s.id))
+    )
+    setSnapshotItems(prev =>
+      prev ? prev.filter(item => liveIds.has(item.session.id)) : prev
+    )
+    // snapshotItems intentionally omitted to avoid a self-triggering loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allSessions, open])
+
   const unreadItems = useMemo((): UnreadItem[] => {
     if (!allSessions) return []
     const results: UnreadItem[] = []

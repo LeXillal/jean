@@ -7,7 +7,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
-import { Tag, Check, Pencil, Pin } from 'lucide-react'
+import { Tag, Check, Pencil, Pin, Trash2 } from 'lucide-react'
 import { useChatStore } from '@/store/chat-store'
 import type { LabelData } from '@/types/chat'
 import { getLabelTextColor } from '@/lib/label-colors'
@@ -44,6 +44,10 @@ interface LabelModalProps {
   extraLabels?: LabelData[]
   /** Callback when a label's color is edited (e.g. to propagate to worktree labels) */
   onColorChange?: (labelName: string, newColor: string) => void
+  /** Callback when a label is pinned/unpinned as a project filter tab. */
+  onPinnedChange?: (label: LabelData, pinned: boolean) => void
+  /** Callback when a custom label should be deleted from the project. */
+  onDeleteLabel?: (label: LabelData) => void
 }
 
 export function LabelModal({
@@ -57,6 +61,8 @@ export function LabelModal({
   onApplyLabels,
   extraLabels,
   onColorChange,
+  onPinnedChange,
+  onDeleteLabel,
 }: LabelModalProps) {
   const [inputValue, setInputValue] = useState('')
   const [selectedColor, setSelectedColor] = useState(
@@ -104,11 +110,15 @@ export function LabelModal({
       if (colorOverrides[name]) {
         return { ...(selected ?? { name }), color: colorOverrides[name] }
       }
-      if (selected) return selected
+      const extra = extraLabels?.find(l => l.name === name)
+      if (selected) {
+        return extra?.pinned ? { ...selected, pinned: true } : selected
+      }
       // Check if this label name exists in sessionLabels or extraLabels (has a color)
       const existing = Object.values(sessionLabels).find(l => l.name === name)
-      if (existing) return existing
-      const extra = extraLabels?.find(l => l.name === name)
+      if (existing) {
+        return extra?.pinned ? { ...existing, pinned: true } : existing
+      }
       if (extra) return extra
       // Preset labels get yellow by default
       return { name, color: '#eab308' }
@@ -285,6 +295,11 @@ export function LabelModal({
       e.stopPropagation()
       if (mode !== 'multi') return
 
+      if (onPinnedChange) {
+        onPinnedChange(labelData, !labelData.pinned)
+        return
+      }
+
       const next = selectedLabels.map(label =>
         label.name === labelData.name
           ? { ...label, pinned: !label.pinned }
@@ -292,7 +307,15 @@ export function LabelModal({
       )
       onApplyLabels?.(next)
     },
-    [mode, onApplyLabels, selectedLabels]
+    [mode, onApplyLabels, onPinnedChange, selectedLabels]
+  )
+
+  const deleteLabel = useCallback(
+    (labelData: LabelData, e: React.MouseEvent) => {
+      e.stopPropagation()
+      onDeleteLabel?.(labelData)
+    },
+    [onDeleteLabel]
   )
 
   // Are we in edit mode?
@@ -414,7 +437,7 @@ export function LabelModal({
                       style={{ backgroundColor: labelData.color }}
                     />
                     <span className="flex-1 truncate">{labelName}</span>
-                    {mode === 'multi' && isSelected && (
+                    {mode === 'multi' && (
                       <Pin
                         className={`h-3 w-3 transition-opacity mr-1 ${
                           labelData.pinned
@@ -426,10 +449,18 @@ export function LabelModal({
                     )}
                     {isSelected && <Check className="h-3 w-3 mr-1" />}
                     {isCustom && (
-                      <Pencil
-                        className="h-3 w-3 opacity-0 group-hover:opacity-50 hover:!opacity-100 transition-opacity mr-1"
-                        onClick={e => startEditColor(labelData, e)}
-                      />
+                      <>
+                        {onDeleteLabel && (
+                          <Trash2
+                            className="h-3 w-3 opacity-0 group-hover:opacity-50 hover:!opacity-100 transition-opacity mr-1 text-destructive"
+                            onClick={e => deleteLabel(labelData, e)}
+                          />
+                        )}
+                        <Pencil
+                          className="h-3 w-3 opacity-0 group-hover:opacity-50 hover:!opacity-100 transition-opacity mr-1"
+                          onClick={e => startEditColor(labelData, e)}
+                        />
+                      </>
                     )}
                   </button>
                 )

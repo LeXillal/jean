@@ -2,8 +2,14 @@ import { describe, expect, it } from 'vitest'
 import type { LabelData } from '@/types/chat'
 import type { Worktree } from '@/types/projects'
 import {
+  countWorktreesWithLabel,
+  deleteLabelFromRegistry,
+  mergeLabelRegistry,
+  mergePinnedLabels,
   getPinnedWorktreeLabelTabs,
   getWorktreeLabels,
+  removeLabelFromLabels,
+  setLabelPinned,
   updateWorktreeLabelsByName,
 } from './worktree-labels'
 
@@ -51,6 +57,23 @@ describe('updateWorktreeLabelsByName', () => {
 })
 
 describe('getPinnedWorktreeLabelTabs', () => {
+  it('shows project-pinned labels even when no worktree currently has that label', () => {
+    const tabs = getPinnedWorktreeLabelTabs(
+      [worktree('one', [{ name: 'Bug', color: '#eab308' }])],
+      [{ name: 'Feature', color: '#22c55e', pinned: true }]
+    )
+
+    expect(tabs).toEqual([
+      {
+        value: 'label:feature',
+        label: 'Feature',
+        color: '#22c55e',
+        count: 0,
+        labelName: 'Feature',
+      },
+    ])
+  })
+
   it('counts every worktree with a pinned label name, even when only one instance is pinned', () => {
     const tabs = getPinnedWorktreeLabelTabs([
       worktree('one', [{ name: 'v4.2', color: '#84cc16', pinned: true }]),
@@ -112,5 +135,102 @@ describe('getPinnedWorktreeLabelTabs', () => {
         labelName: 'Blocked',
       },
     ])
+  })
+})
+
+describe('mergePinnedLabels', () => {
+  it('applies project pinned metadata without requiring the label to be selected', () => {
+    expect(
+      mergePinnedLabels(
+        [{ name: 'Bug', color: '#eab308' }],
+        [{ name: 'Bug', color: '#22c55e', pinned: true }]
+      )
+    ).toEqual([{ name: 'Bug', color: '#eab308', pinned: true }])
+  })
+})
+
+describe('setLabelPinned', () => {
+  it('adds an unassigned label to the project pinned registry', () => {
+    expect(
+      setLabelPinned([], { name: 'Feature', color: '#22c55e' }, true)
+    ).toEqual([{ name: 'Feature', color: '#22c55e', pinned: true }])
+  })
+
+  it('removes a label from the project pinned registry when unpinned', () => {
+    expect(
+      setLabelPinned(
+        [{ name: 'Feature', color: '#22c55e', pinned: true }],
+        { name: 'Feature', color: '#22c55e', pinned: true },
+        false
+      )
+    ).toEqual([])
+  })
+})
+
+describe('mergeLabelRegistry', () => {
+  it('keeps unassigned labels while adding newly assigned labels', () => {
+    expect(
+      mergeLabelRegistry(
+        [{ name: 'Preserved', color: '#22c55e' }],
+        [{ name: 'Assigned', color: '#eab308' }]
+      )
+    ).toEqual([
+      { name: 'Preserved', color: '#22c55e' },
+      { name: 'Assigned', color: '#eab308' },
+    ])
+  })
+
+  it('updates registry label metadata from assigned labels without duplicating by case', () => {
+    expect(
+      mergeLabelRegistry(
+        [{ name: 'Bug', color: '#eab308' }],
+        [{ name: 'bug', color: '#ef4444', pinned: true }]
+      )
+    ).toEqual([{ name: 'Bug', color: '#ef4444', pinned: true }])
+  })
+})
+
+describe('deleteLabelFromRegistry', () => {
+  it('removes a label from the preserved registry by name', () => {
+    expect(
+      deleteLabelFromRegistry(
+        [
+          { name: 'Bug', color: '#eab308' },
+          { name: 'Feature', color: '#22c55e' },
+        ],
+        'bug'
+      )
+    ).toEqual([{ name: 'Feature', color: '#22c55e' }])
+  })
+})
+
+describe('removeLabelFromLabels', () => {
+  it('removes a label from a worktree label array by name', () => {
+    expect(
+      removeLabelFromLabels(
+        [
+          { name: 'Bug', color: '#eab308' },
+          { name: 'Feature', color: '#22c55e' },
+        ],
+        'BUG'
+      )
+    ).toEqual([{ name: 'Feature', color: '#22c55e' }])
+  })
+})
+
+describe('countWorktreesWithLabel', () => {
+  it('counts non-deleting worktrees with a label name', () => {
+    expect(
+      countWorktreesWithLabel(
+        [
+          worktree('one', [{ name: 'Bug', color: '#eab308' }]),
+          worktree('two', [{ name: 'bug', color: '#22c55e' }]),
+          worktree('deleting', [{ name: 'Bug', color: '#ef4444' }], {
+            status: 'deleting',
+          }),
+        ],
+        'BUG'
+      )
+    ).toBe(2)
   })
 })
