@@ -39,11 +39,16 @@ export function buildMessageWithRefs(queuedMsg: QueuedMessage): string {
     message = message ? `${message}\n\n${skillRefs}` : skillRefs
   }
 
-  if (queuedMsg.pendingImages.length > 0) {
+  // Skip still-processing placeholders (empty path / loading) so Claude never
+  // receives "[Image attached:  - Use the Read tool...]" with no real file.
+  const readyImages = queuedMsg.pendingImages.filter(
+    img => !img.loading && Boolean(img.path?.trim())
+  )
+  if (readyImages.length > 0) {
     if (!message) {
       message = IMAGE_ONLY_DEFAULT_PROMPT
     }
-    const imageRefs = queuedMsg.pendingImages
+    const imageRefs = readyImages
       .map(
         img =>
           `[Image attached: ${img.path} - Use the Read tool to view this image]`

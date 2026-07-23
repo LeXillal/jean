@@ -104,4 +104,30 @@ describe('buildMessageWithRefs', () => {
       '[File: /tmp/docs/docs/intro.md - Use the Read tool to view this file]'
     )
   })
+
+  it('skips loading/empty-path image placeholders (clipboard still saving)', () => {
+    const message = buildMessageWithRefs(
+      queuedMessage({
+        message: 'Can you see this?',
+        pendingImages: [
+          {
+            id: 'loading-1',
+            path: '',
+            filename: 'Processing...',
+            loading: true,
+          },
+          {
+            id: 'img-1',
+            path: '/tmp/ready.png',
+            filename: 'ready.png',
+          },
+        ],
+      })
+    )
+
+    expect(message).toBe(
+      'Can you see this?\n\n[Image attached: /tmp/ready.png - Use the Read tool to view this image]'
+    )
+    expect(message).not.toContain('[Image attached:  -')
+  })
 })

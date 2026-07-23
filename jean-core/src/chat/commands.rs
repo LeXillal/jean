@@ -1234,11 +1234,24 @@ fn build_queued_message_with_refs(queued: &Value) -> Result<String, String> {
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    if !pending_images.is_empty() {
+    // Skip still-processing / empty-path placeholders so Claude never receives a
+    // marker with no readable file (clipboard screenshots start with path: "").
+    let ready_images: Vec<&Value> = pending_images
+        .iter()
+        .filter(|image| {
+            let loading = image
+                .get("loading")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let path = image.get("path").and_then(Value::as_str).unwrap_or("");
+            !loading && !path.trim().is_empty()
+        })
+        .collect();
+    if !ready_images.is_empty() {
         if message.is_empty() {
             message = IMAGE_ONLY_DEFAULT_PROMPT.to_string();
         }
-        let refs = pending_images
+        let refs = ready_images
             .iter()
             .map(|image| {
                 let path = image
@@ -6941,14 +6954,15 @@ fn execute_summarization_claude(
         .spawn()
         .map_err(|e| format!("Failed to spawn Claude CLI: {e}"))?;
 
-    // Write prompt to stdin as stream-json format
+    // Write prompt to stdin as stream-json format (multimodal when images present)
     {
         let stdin = child.stdin.as_mut().ok_or("Failed to open stdin")?;
+        let content = super::run_log::build_claude_user_message_content(prompt);
         let input_message = serde_json::json!({
             "type": "user",
             "message": {
                 "role": "user",
-                "content": prompt
+                "content": content
             }
         });
         writeln!(stdin, "{input_message}").map_err(|e| format!("Failed to write to stdin: {e}"))?;

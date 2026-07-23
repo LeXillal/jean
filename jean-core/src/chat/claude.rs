@@ -391,6 +391,20 @@ fn split_fast_model(model: &str) -> (&str, bool) {
     }
 }
 
+/// Path as seen by the Claude CLI process.
+///
+/// When Jean runs on Windows with WSL mode enabled, Claude executes inside the
+/// distro and needs `/mnt/c/...` paths for `--add-dir` (and any Read fallback).
+fn claude_accessible_path(path: String) -> String {
+    #[cfg(windows)]
+    {
+        if crate::platform::get_wsl_config().enabled {
+            return crate::platform::win_to_wsl_path(&path);
+        }
+    }
+    path
+}
+
 /// Build CLI arguments for Claude CLI.
 ///
 /// Returns a tuple of (args, env_vars) where env_vars are (key, value) pairs.
@@ -427,11 +441,18 @@ fn build_claude_args(
     // to the UI without waiting for message boundaries.
     args.push("--include-partial-messages".to_string());
 
+    // Claude may run inside WSL while Jean stores paths as Windows paths. Convert
+    // --add-dir roots so pasted-images / contexts remain readable via Read as a
+    // fallback when multimodal embedding is unavailable.
+    let add_dir = |args: &mut Vec<String>, path: String| {
+        args.push("--add-dir".to_string());
+        args.push(claude_accessible_path(path));
+    };
+
     // Add app data directories
     if let Ok(app_data_dir) = app.path().app_data_dir() {
         if cfg!(debug_assertions) {
-            args.push("--add-dir".to_string());
-            args.push(app_data_dir.to_string_lossy().to_string());
+            add_dir(&mut args, app_data_dir.to_string_lossy().to_string());
         } else {
             for subdir in [
                 "pasted-images",
@@ -440,13 +461,14 @@ fn build_claude_args(
                 "git-context",
                 "combined-contexts",
             ] {
-                args.push("--add-dir".to_string());
-                args.push(app_data_dir.join(subdir).to_string_lossy().to_string());
+                add_dir(
+                    &mut args,
+                    app_data_dir.join(subdir).to_string_lossy().to_string(),
+                );
             }
             // Add session-specific runs directory
             let session_runs_dir = app_data_dir.join("runs").join(session_id);
-            args.push("--add-dir".to_string());
-            args.push(session_runs_dir.to_string_lossy().to_string());
+            add_dir(&mut args, session_runs_dir.to_string_lossy().to_string());
         }
     }
 
@@ -468,8 +490,7 @@ fn build_claude_args(
         })
         .unwrap_or_default();
     for dir in &linked_project_paths {
-        args.push("--add-dir".to_string());
-        args.push(dir.clone());
+        add_dir(&mut args, dir.clone());
     }
 
     // Add Claude CLI skills and commands directories (~/.claude/skills and ~/.claude/commands)
@@ -478,8 +499,7 @@ fn build_claude_args(
         for subdir in ["skills", "commands"] {
             let dir_path = claude_dir.join(subdir);
             if dir_path.exists() {
-                args.push("--add-dir".to_string());
-                args.push(dir_path.to_string_lossy().to_string());
+                add_dir(&mut args, dir_path.to_string_lossy().to_string());
             }
         }
     }

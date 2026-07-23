@@ -434,10 +434,141 @@ pub fn start_run(
     })
 }
 
+/// Marker Jean appends for pasted images so backends can resolve attachments.
+const IMAGE_ATTACHMENT_MARKER_SUFFIX: &str = " - Use the Read tool to view this image]";
+const IMAGE_ATTACHMENT_MARKER_PREFIX: &str = "[Image attached: ";
+
+/// Build Claude stream-json `message.content` for a user turn.
+///
+/// Pasted images are embedded as multimodal `image` blocks (base64) so Claude
+/// Code can see them without a Read tool call. Clipboard screenshots only exist
+/// under Jean's app-data `pasted-images/` directory (outside the worktree); relying
+/// on path markers + Read frequently fails with "files don't exist on disk".
+///
+/// The path markers remain stripped from the text block when embedding succeeds.
+/// If a file cannot be read, a clear note is left in the text so the agent does
+/// not silently invent context.
+pub fn build_claude_user_message_content(message: &str) -> serde_json::Value {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use regex::Regex;
+
+    // `*?` so empty-path placeholders (`[Image attached:  - Use ...]`) are
+    // still recognized and stripped instead of being left for the model.
+    let re = Regex::new(&format!(
+        r"{}(.*?){}",
+        regex::escape(IMAGE_ATTACHMENT_MARKER_PREFIX),
+        regex::escape(IMAGE_ATTACHMENT_MARKER_SUFFIX)
+    ))
+    .expect("valid image attachment regex");
+
+    let mut cleaned = message.to_string();
+    let mut image_blocks: Vec<serde_json::Value> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+
+    for cap in re.captures_iter(message) {
+        let full = cap.get(0).map(|m| m.as_str()).unwrap_or_default();
+        let path = cap
+            .get(1)
+            .map(|m| m.as_str().trim())
+            .unwrap_or_default();
+        cleaned = cleaned.replacen(full, "", 1);
+
+        if path.is_empty() {
+            missing.push("(empty path — image was still processing when sent)".to_string());
+            continue;
+        }
+
+        // Host filesystem path (Windows paths when WSL is enabled — Jean runs
+        // natively and can still read them for base64 embedding).
+        match std::fs::read(path) {
+            Ok(data) if !data.is_empty() => {
+                let mime = mime_type_for_image_path(path);
+                image_blocks.push(serde_json::json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": mime,
+                        "data": STANDARD.encode(data),
+                    }
+                }));
+            }
+            Ok(_) => {
+                log::warn!("Claude image attachment is empty: {path}");
+                missing.push(path.to_string());
+            }
+            Err(e) => {
+                log::warn!("Claude image attachment missing on disk ({path}): {e}");
+                missing.push(path.to_string());
+            }
+        }
+    }
+
+    let mut text = cleaned
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+
+    if !missing.is_empty() {
+        let notes = missing
+            .iter()
+            .map(|p| format!("[Image could not be loaded from disk: {p}]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        text = if text.is_empty() {
+            notes
+        } else {
+            format!("{text}\n\n{notes}")
+        };
+    }
+
+    // No images → keep the historical string content shape (Claude CLI accepts
+    // either a string or a content-block array).
+    if image_blocks.is_empty() {
+        return serde_json::Value::String(if text.is_empty() {
+            message.to_string()
+        } else {
+            text
+        });
+    }
+
+    let mut blocks = image_blocks;
+    if !text.is_empty() {
+        blocks.push(serde_json::json!({ "type": "text", "text": text }));
+    } else {
+        // Image-only turns still need a text block so the model has an explicit
+        // request (mirrors IMAGE_ONLY_DEFAULT_PROMPT on the frontend).
+        blocks.push(serde_json::json!({
+            "type": "text",
+            "text": "Please check this image and tell me what is wrong."
+        }));
+    }
+
+    serde_json::Value::Array(blocks)
+}
+
+fn mime_type_for_image_path(path: &str) -> &'static str {
+    match std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "image/png",
+    }
+}
+
 /// Write the input file for a detached Claude CLI run.
 ///
 /// The input file contains the user message in stream-json format,
-/// which Claude CLI reads via stdin redirection.
+/// which Claude CLI reads via stdin redirection. Pasted images are
+/// embedded as multimodal content blocks when the files exist on disk.
 pub fn write_input_file(
     app: &tauri::AppHandle,
     session_id: &str,
@@ -449,12 +580,12 @@ pub fn write_input_file(
 
     log::trace!("Writing input file at: {input_path:?}");
 
-    // Create the stream-json input message format
+    let content = build_claude_user_message_content(message);
     let input_message = serde_json::json!({
         "type": "user",
         "message": {
             "role": "user",
-            "content": message
+            "content": content
         }
     });
 
@@ -1909,6 +2040,82 @@ mod tests {
             &msg.content_blocks[0],
             ContentBlock::Text { text } if text == "Actual partial response."
         ));
+    }
+
+    #[test]
+    fn build_claude_user_message_content_plain_text_stays_string() {
+        let content = build_claude_user_message_content("hello without images");
+        assert_eq!(
+            content,
+            serde_json::Value::String("hello without images".to_string())
+        );
+    }
+
+    #[test]
+    fn build_claude_user_message_content_embeds_image_as_base64_block() {
+        let dir = std::env::temp_dir().join(format!(
+            "jean-claude-image-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shot.png");
+        // Minimal valid 1x1 PNG
+        let png: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x05, 0xFE,
+            0xD4, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(&path, png).unwrap();
+        let path_str = path.to_string_lossy();
+        let message = format!(
+            "Can you see it?\n\n[Image attached: {path_str} - Use the Read tool to view this image]"
+        );
+
+        let content = build_claude_user_message_content(&message);
+        let blocks = content.as_array().expect("content should be block array");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[0]["source"]["type"], "base64");
+        assert_eq!(blocks[0]["source"]["media_type"], "image/png");
+        assert!(
+            blocks[0]["source"]["data"]
+                .as_str()
+                .unwrap_or_default()
+                .len()
+                > 20
+        );
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], "Can you see it?");
+        // Marker should not remain for the model once embedded
+        assert!(
+            !blocks[1]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Image attached")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_claude_user_message_content_notes_missing_files() {
+        let message = "Look\n\n[Image attached: /tmp/definitely-missing-jean-shot-xyz.png - Use the Read tool to view this image]";
+        let content = build_claude_user_message_content(message);
+        let text = content.as_str().expect("text-only when no images loaded");
+        assert!(text.contains("Image could not be loaded from disk"));
+        assert!(text.contains("definitely-missing-jean-shot-xyz.png"));
+        assert!(!text.contains("[Image attached:"));
+    }
+
+    #[test]
+    fn build_claude_user_message_content_skips_empty_path_markers() {
+        let message =
+            "Look\n\n[Image attached:  - Use the Read tool to view this image]";
+        let content = build_claude_user_message_content(message);
+        let text = content.as_str().expect("string content");
+        assert!(text.contains("empty path") || text.contains("could not be loaded"));
     }
 }
 

@@ -462,14 +462,16 @@ fn generate_names(app: &AppHandle, request: &NamingRequest) -> Result<NamingOutp
         .spawn()
         .map_err(|e| format!("Failed to spawn Claude CLI: {e}"))?;
 
-    // Write prompt to stdin as stream-json format
+    // Write prompt to stdin as stream-json format. Embed pasted images as
+    // multimodal blocks so naming can see clipboard screenshots without Read.
     {
         let stdin = child.stdin.as_mut().ok_or("Failed to open stdin")?;
+        let content = super::run_log::build_claude_user_message_content(&prompt);
         let input_message = serde_json::json!({
             "type": "user",
             "message": {
                 "role": "user",
-                "content": prompt
+                "content": content
             }
         });
         writeln!(stdin, "{input_message}").map_err(|e| format!("Failed to write to stdin: {e}"))?;

@@ -292,6 +292,15 @@ export function useMessageSending({
         return
       if (!activeSessionId || !activeWorktreeId || !activeWorktreePath) return
 
+      // Clipboard screenshots start with a loading placeholder (empty path).
+      // Wait until save_pasted_image finishes so the agent receives a real file.
+      if (images.some(img => img.loading || !img.path?.trim())) {
+        toast.error('Still processing image', {
+          description: 'Wait for the screenshot to finish saving, then send.',
+        })
+        return
+      }
+
       if (
         sessionsData &&
         !sessionsData.sessions.some(
