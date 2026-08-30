@@ -12,6 +12,7 @@ import {
   invoke,
   useWsConnectionStatus,
   useWsAuthError,
+  useWsAuthReason,
   preloadInitialData,
   setAppDataDir,
   hasPreloadedData,
@@ -121,9 +122,10 @@ function handleWsAuthTokenSubmit(token: string) {
   window.location.reload()
 }
 
-/** Full-screen auth error overlay for web access mode. */
+/** Sign-in surface for web access mode, shown until the session is authorized. */
 function WsAuthErrorOverlay() {
   const authError = useWsAuthError()
+  const authReason = useWsAuthReason()
   const remote = getActiveRemoteConnection()
 
   if (!authError) return null
@@ -133,9 +135,10 @@ function WsAuthErrorOverlay() {
   }
 
   return (
-    <div className="fixed inset-0 z-[80] flex items-center justify-center bg-background/90">
+    <div className="fixed inset-0 z-[80] flex items-center justify-center bg-background">
       <WebAccessAuthScreen
         authError={authError}
+        reason={authReason ?? 'signed-out'}
         onTokenSubmit={handleWsAuthTokenSubmit}
       />
     </div>
@@ -1635,6 +1638,14 @@ function App() {
   // on WS when preload failed and we have nothing to show.
   const blockOnWs =
     webBackend && !wsConnected && !wsAuthError && !hasPreloadedData()
+
+  // A browser session that has not authenticated yet has nothing to show
+  // behind the sign-in prompt. Render it alone instead of booting the whole
+  // app underneath and covering it with an overlay. Native remote clients keep
+  // the overlay: their local UI stays usable while a remote is unreachable.
+  if (webBackend && wsAuthError && !getActiveRemoteConnection()) {
+    return <WsAuthErrorOverlay />
+  }
 
   if (isPreloading || blockOnWs) {
     return (
