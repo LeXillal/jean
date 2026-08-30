@@ -6,11 +6,11 @@ import React, {
   useRef,
   type FC,
 } from 'react'
-import { invoke } from '@/lib/transport'
+import { invoke, signOutOfWebAccess } from '@/lib/transport'
 import { loginArgsForBackend } from '@/lib/cli-auth'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { Loader2, Check, ChevronsUpDown, Play } from 'lucide-react'
+import { Loader2, Check, ChevronsUpDown, LogOut, Play } from 'lucide-react'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -5024,6 +5024,30 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
             </div>
           </SettingsSection>
         </>
+      )}
+
+      {isGeneralScope && isWebAccessView && (
+        <SettingsSection
+          title="This browser"
+          description="You are signed in to this Jean server with an access token kept in this browser."
+          anchorId="pref-general-section-session"
+          variant="card"
+        >
+          <InlineField
+            label={window.location.host}
+            description="Signing out forgets the token on this device only. The server keeps running and your other devices stay signed in."
+          >
+            <Button
+              variant="outline"
+              size="sm"
+              className="sm:ml-auto"
+              onClick={signOutOfWebAccess}
+            >
+              <LogOut className="size-3.5" />
+              Sign out
+            </Button>
+          </InlineField>
+        </SettingsSection>
       )}
 
       <AlertDialog

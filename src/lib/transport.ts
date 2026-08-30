@@ -1175,3 +1175,16 @@ export function useWsAuthReason(): WsAuthReason | null {
     isE2eMocked ? () => null : getAuthReasonSnapshot
   )
 }
+
+/**
+ * Forget the access token stored in this browser and return to the sign-in
+ * screen. Only affects this device — the server keeps running and other
+ * browsers stay signed in.
+ */
+export function signOutOfWebAccess(): void {
+  localStorage.removeItem('jean-http-token')
+  // Reload on a bare origin. A bookmarked `?token=...` takes priority over
+  // localStorage on boot, so keeping the current URL would sign us straight
+  // back in and make the button look broken.
+  window.location.replace(`${window.location.origin}/`)
+}
