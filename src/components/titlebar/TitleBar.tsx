@@ -198,7 +198,7 @@ export function TitleBar({
                 <TooltipContent>GitHub</TooltipContent>
               </Tooltip>
             )}
-            {native && <RemoteConnectionsDialog />}
+            <RemoteConnectionsDialog />
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button
