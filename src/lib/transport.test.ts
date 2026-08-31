@@ -883,3 +883,162 @@ describe('transport registry (multi-instance)', () => {
     expect(transport.getInstanceStatus(SAT_A.id)).toBe('idle')
   })
 })
+
+describe('transport registry — failure handling', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    MockWebSocket.instances = []
+    localStorage.clear()
+    vi.stubGlobal('WebSocket', MockWebSocket)
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+    vi.resetModules()
+  })
+
+  it('keeps retrying a satellite whose server is simply down', async () => {
+    // The hub answers 502 for a remote it cannot reach. That is an outage, not
+    // a credential problem: treating it as an auth error would set _authError
+    // and permanently disarm the retry loop.
+    vi.stubGlobal(
+      'fetch',
+      vi
+        .fn()
+        .mockResolvedValue({ ok: false, status: 502, json: async () => ({}) })
+    )
+    const { transport } = await loadMultiInstanceTransportModule()
+
+    transport.ensureSatelliteTransport(SAT_A.id)
+    await flushAsync()
+
+    expect(transport.getInstanceStatus(SAT_A.id)).not.toBe('auth-error')
+
+    await new Promise(resolve => setTimeout(resolve, 250))
+    await flushAsync()
+    expect(vi.mocked(fetch).mock.calls.length).toBeGreaterThan(1)
+  })
+
+  it('stops a satellite whose token the hub refuses', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi
+        .fn()
+        .mockResolvedValue({ ok: false, status: 401, json: async () => ({}) })
+    )
+    const { transport } = await loadMultiInstanceTransportModule()
+
+    transport.ensureSatelliteTransport(SAT_A.id)
+    await flushAsync()
+
+    expect(transport.getInstanceStatus(SAT_A.id)).toBe('auth-error')
+    const callsAfterFirst = vi.mocked(fetch).mock.calls.length
+    await new Promise(resolve => setTimeout(resolve, 250))
+    expect(vi.mocked(fetch).mock.calls.length).toBe(callsAfterFirst)
+  })
+
+  it('does not reset the backoff for a socket that closes immediately', async () => {
+    // The hub accepts the WebSocket upgrade before it knows the remote is
+    // reachable, so a dead remote yields open-then-close. If that counted as a
+    // successful connection the delay would stay at 100ms and hammer the hub.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) })
+    )
+    vi.useFakeTimers()
+    const { transport } = await loadMultiInstanceTransportModule()
+
+    transport.ensureSatelliteTransport(SAT_A.id)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(MockWebSocket.instances).toHaveLength(1)
+
+    // First drop: retried after the initial 100ms.
+    getWs(0).close()
+    await vi.advanceTimersByTimeAsync(150)
+    expect(MockWebSocket.instances).toHaveLength(2)
+
+    // Second drop: the backoff must have grown past 100ms.
+    getWs(1).close()
+    await vi.advanceTimersByTimeAsync(150)
+    expect(MockWebSocket.instances).toHaveLength(2)
+
+    await vi.advanceTimersByTimeAsync(500)
+    expect(MockWebSocket.instances).toHaveLength(3)
+  })
+
+  it('never opens a socket for an instance released mid-probe', async () => {
+    let resolveAuth: ((value: unknown) => void) | undefined
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockImplementation(
+        () =>
+          new Promise(resolve => {
+            resolveAuth = resolve
+          })
+      )
+    )
+    const { transport } = await loadMultiInstanceTransportModule()
+
+    transport.ensureSatelliteTransport(SAT_A.id)
+    await flushAsync()
+    expect(MockWebSocket.instances).toHaveLength(0)
+
+    // The connection is deleted while the auth probe is still in flight.
+    transport.releaseTransport(SAT_A.id)
+    resolveAuth?.({ ok: true, json: async () => ({}) })
+    await flushAsync()
+
+    // A socket opened now could never be closed — and would resolve to the hub
+    // rather than to the removed remote.
+    expect(MockWebSocket.instances).toHaveLength(0)
+  })
+
+  it('drops satellite events nobody listens for instead of buffering them', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) })
+    )
+    const { transport } = await loadMultiInstanceTransportModule()
+
+    transport.ensureSatelliteTransport(SAT_A.id)
+    await flushAsync()
+
+    // The server broadcasts everything to every client; a satellite only cares
+    // about a couple of list-level events.
+    for (let i = 0; i < 10; i++) {
+      getWs(0).receive({
+        type: 'event',
+        event: 'chat:chunk',
+        seq: i,
+        payload: { session_id: 's1', text: 'x' },
+      })
+    }
+
+    const late = vi.fn()
+    await transport.listenOn(SAT_A.id, 'chat:chunk', late)
+    expect(late).not.toHaveBeenCalled()
+  })
+
+  it('fires the disconnect callback registered before the focus id resolved', async () => {
+    // App.tsx subscribes on first render, while the connection list is still
+    // loading and getActiveConnectionId() still reads 'local'.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) })
+    )
+    const { transport, focus } = await loadMultiInstanceTransportModule()
+    const onDisconnect = vi.fn()
+
+    transport.onEstablishedWsDisconnect(onDisconnect)
+
+    // The stored selection resolves to a remote once the list arrives.
+    focus.id = SAT_A.id
+    transport.connectTransport()
+    await flushAsync()
+
+    getWs(0).close()
+
+    expect(onDisconnect).toHaveBeenCalledOnce()
+  })
+})
