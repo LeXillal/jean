@@ -108,8 +108,7 @@ export function WebAccessAuthScreen({
       </form>
 
       <p className="mt-8 text-center text-xs text-muted-foreground">
-        Find the token in Web Access settings, or in /etc/jean-server.env on the
-        server.
+        Find the token in Jean&apos;s Web Access settings.
       </p>
     </div>
   )
