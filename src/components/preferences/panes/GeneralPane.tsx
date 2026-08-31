@@ -6,7 +6,7 @@ import React, {
   useRef,
   type FC,
 } from 'react'
-import { invoke } from '@/lib/transport'
+import { invoke, probeConnectionServerInfo } from '@/lib/transport'
 import { loginArgsForBackend } from '@/lib/cli-auth'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -198,10 +198,7 @@ import {
 import { playNotificationSound } from '@/lib/sounds'
 import { CLIENT_BUILD_INFO } from '@/lib/build-info'
 import { getActiveRemoteConnection } from '@/lib/remote-connections'
-import {
-  fetchRemoteServerInfo,
-  formatJeanVersionLabel,
-} from '@/lib/remote-version'
+import { formatJeanVersionLabel } from '@/lib/remote-version'
 import type { ThinkingLevel, EffortLevel } from '@/types/chat'
 import { hasBackend, isNativeApp } from '@/lib/environment'
 import { isWindows, openExternal } from '@/lib/platform'
@@ -315,10 +312,7 @@ export const GeneralPane: React.FC<{ scope?: PreferencesPaneScope }> = ({
         if (!activeRemoteConnection) {
           throw new Error('No remote Jean server is connected.')
         }
-        return fetchRemoteServerInfo(
-          activeRemoteConnection.url,
-          activeRemoteConnection.token
-        )
+        return probeConnectionServerInfo(activeRemoteConnection)
       },
       enabled: isGeneralScope && activeRemoteConnection !== null,
       staleTime: 60_000,

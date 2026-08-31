@@ -1,5 +1,6 @@
 import { invoke, listen } from '@/lib/transport'
 import { isNativeApp } from '@/lib/environment'
+import { getActiveRemoteConnection } from '@/lib/remote-connections'
 import { generateId } from '@/lib/uuid'
 import type { CommitJob, StartCommitJobResponse } from '@/types/projects'
 
@@ -57,7 +58,11 @@ async function startWebCommitJob(
 ): Promise<StartCommitJobResponse> {
   const token = localStorage.getItem('jean-http-token') ?? ''
   const query = token ? `?token=${encodeURIComponent(token)}` : ''
-  const url = `/api/commit-jobs${query}`
+  // When a remote is active in web mode, relay through the origin hub proxy
+  // (`/remote/<id>/...`) with the hub token; local stays same-origin relative.
+  const remote = getActiveRemoteConnection()
+  const base = remote ? `${window.location.origin}/remote/${remote.id}` : ''
+  const url = `${base}/api/commit-jobs${query}`
   const body = JSON.stringify({ ...args, jobId })
 
   // Beacon is specifically designed to be delivered while iOS suspends the

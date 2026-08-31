@@ -5,7 +5,11 @@ import { usePreferences } from '@/services/preferences'
 import { useProjects, useAppDataDir } from '@/services/projects'
 import { useChatStore } from '@/store/chat-store'
 import { useProjectsStore } from '@/store/projects-store'
-import { convertFileSrc, convertProjectFileSrc } from '@/lib/transport'
+import {
+  convertFileSrc,
+  convertProjectFileSrc,
+  probeConnectionServerInfo,
+} from '@/lib/transport'
 import { getAllCommands, executeCommand } from '@/lib/commands'
 import { formatShortcutDisplay } from '@/types/keybindings'
 import { Monitor, Server } from 'lucide-react'
@@ -17,10 +21,7 @@ import {
   selectConnection,
   useRemoteConnections,
 } from '@/lib/remote-connections'
-import {
-  fetchRemoteServerInfo,
-  warnRemoteVersionMismatch,
-} from '@/lib/remote-version'
+import { warnRemoteVersionMismatch } from '@/lib/remote-version'
 import {
   CommandDialog,
   CommandInput,
@@ -183,10 +184,7 @@ export function CommandPalette({
           }
           // Warn on mismatch but still switch; transport re-checks after load.
           try {
-            const info = await fetchRemoteServerInfo(
-              connection.url,
-              connection.token
-            )
+            const info = await probeConnectionServerInfo(connection)
             warnRemoteVersionMismatch(info.appVersion)
           } catch {
             // Unreachable remotes still switch so recovery UI can handle them.

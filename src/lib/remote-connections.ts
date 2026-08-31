@@ -14,7 +14,12 @@ export interface RemoteConnection {
   id: string
   name: string
   url: string
-  token: string
+  /**
+   * Access token. Optional: web clients load the list from the origin hub,
+   * which masks tokens (write-only field). Native clients keep the real token
+   * in their machine-local storage.
+   */
+  token?: string
   /** SSH user for local editors that open remote paths (Zed `ssh://`). */
   sshUser?: string
   /** SSH host/IP; falls back to Web Access URL hostname when omitted. */
@@ -26,7 +31,8 @@ export interface RemoteConnection {
 export interface RemoteConnectionInput {
   name: string
   url: string
-  token: string
+  /** Only sent when (re)entered; empty/omitted keeps the stored token. */
+  token?: string
   sshUser?: string
   sshHost?: string
   sshPort?: number
@@ -77,8 +83,7 @@ function normalizeConnection(item: unknown): RemoteConnection | null {
   if (
     typeof record.id !== 'string' ||
     typeof record.name !== 'string' ||
-    typeof record.url !== 'string' ||
-    typeof record.token !== 'string'
+    typeof record.url !== 'string'
   ) {
     return null
   }
@@ -87,7 +92,11 @@ function normalizeConnection(item: unknown): RemoteConnection | null {
     id: record.id,
     name: record.name,
     url: record.url,
-    token: record.token,
+  }
+
+  // Token is optional: the origin hub masks it in GET responses (write-only).
+  if (typeof record.token === 'string' && record.token) {
+    connection.token = record.token
   }
 
   const sshUser = normalizeOptionalString(record.sshUser)
@@ -219,7 +228,7 @@ export function initRemoteConnections(): Promise<void> {
 
 export function parseRemoteConnectionInput(
   rawUrl: string,
-  rawToken: string
+  rawToken?: string
 ): { url: string; token: string } {
   let parsed: URL
   try {
@@ -233,7 +242,7 @@ export function parseRemoteConnectionInput(
   }
 
   const token =
-    rawToken.trim() || parsed.searchParams.get('token')?.trim() || ''
+    rawToken?.trim() || parsed.searchParams.get('token')?.trim() || ''
   parsed.search = ''
   parsed.hash = ''
   parsed.pathname = parsed.pathname.replace(/\/+$/, '')
@@ -252,9 +261,10 @@ export async function addRemoteConnection(
   const connection: RemoteConnection = {
     id: generateId(),
     name: input.name.trim() || new URL(normalized.url).hostname,
-    ...normalized,
+    url: normalized.url,
     ...sshFieldsFromInput(input),
   }
+  if (normalized.token) connection.token = normalized.token
   await persistConnections([...getRemoteConnections(), connection])
   return connection
 }
@@ -264,16 +274,21 @@ export async function updateRemoteConnection(
   input: RemoteConnectionInput
 ): Promise<RemoteConnection> {
   const normalized = parseRemoteConnectionInput(input.url, input.token)
+  const connections = getRemoteConnections()
+  const existing = connections.find(connection => connection.id === id)
+  if (!existing) {
+    throw new Error('Remote connection not found.')
+  }
   const updated: RemoteConnection = {
     id,
     name: input.name.trim() || new URL(normalized.url).hostname,
-    ...normalized,
+    url: normalized.url,
     ...sshFieldsFromInput(input),
   }
-  const connections = getRemoteConnections()
-  if (!connections.some(connection => connection.id === id)) {
-    throw new Error('Remote connection not found.')
-  }
+  // Write-only token: overwrite only when a new token was entered; otherwise
+  // keep the previously stored one (web clients never see the masked token).
+  const token = normalized.token || existing.token
+  if (token) updated.token = token
   await persistConnections(
     connections.map(connection => (connection.id === id ? updated : connection))
   )

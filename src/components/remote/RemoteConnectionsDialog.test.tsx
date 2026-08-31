@@ -6,15 +6,23 @@ const {
   addRemoteConnection,
   selectConnection,
   fetchRemoteServerInfo,
+  probeConnectionServerInfo,
   getLocalJeanVersion,
   warnRemoteVersionMismatch,
   invoke,
   isNativeApp,
   listenLocal,
+  updateRemoteConnection,
+  useRemoteConnections,
 } = vi.hoisted(() => ({
   addRemoteConnection: vi.fn(() => ({ id: 'remote-1' })),
   selectConnection: vi.fn(),
   fetchRemoteServerInfo: vi.fn(async () => ({
+    ok: true,
+    appVersion: '0.1.69',
+    webBuildId: '0.1.69-test',
+  })),
+  probeConnectionServerInfo: vi.fn(async () => ({
     ok: true,
     appVersion: '0.1.69',
     webBuildId: '0.1.69-test',
@@ -26,6 +34,8 @@ const {
   listenLocal: vi.fn(async () => () => {
     // no-op unsubscribe
   }),
+  updateRemoteConnection: vi.fn(async () => ({ id: 'remote-1' })),
+  useRemoteConnections: vi.fn(() => [] as unknown[]),
 }))
 
 vi.mock('@/lib/remote-connections', () => ({
@@ -54,8 +64,8 @@ vi.mock('@/lib/remote-connections', () => ({
     }
   },
   selectConnection,
-  updateRemoteConnection: vi.fn(),
-  useRemoteConnections: () => [],
+  updateRemoteConnection,
+  useRemoteConnections,
 }))
 
 vi.mock('@/lib/remote-version', () => ({
@@ -81,6 +91,7 @@ vi.mock('@/lib/environment', () => ({
 vi.mock('@/lib/transport', () => ({
   invoke,
   listenLocal,
+  probeConnectionServerInfo,
 }))
 
 describe('RemoteConnectionsDialog', () => {
@@ -91,11 +102,19 @@ describe('RemoteConnectionsDialog', () => {
       appVersion: '0.1.69',
       webBuildId: '0.1.69-test',
     })
+    probeConnectionServerInfo.mockResolvedValue({
+      ok: true,
+      appVersion: '0.1.69',
+      webBuildId: '0.1.69-test',
+    })
     warnRemoteVersionMismatch.mockReturnValue(false)
     isNativeApp.mockReturnValue(false)
+    addRemoteConnection.mockReturnValue({ id: 'remote-1' })
+    updateRemoteConnection.mockResolvedValue({ id: 'remote-1' })
+    useRemoteConnections.mockReturnValue([])
   })
 
-  it('adds and selects a remote from a complete Web Access URL', async () => {
+  it('adds and selects a remote from a complete Web Access URL without probing it directly (web proxy)', async () => {
     const reloadApp = vi.fn()
     render(<RemoteConnectionsDialog reloadApp={reloadApp} />)
 
@@ -110,10 +129,6 @@ describe('RemoteConnectionsDialog', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save & Connect' }))
 
     await waitFor(() => {
-      expect(fetchRemoteServerInfo).toHaveBeenCalledWith(
-        'https://jean.example.com',
-        'secret'
-      )
       expect(addRemoteConnection).toHaveBeenCalledWith({
         name: 'Build server',
         url: 'https://jean.example.com/?token=secret',
@@ -125,9 +140,14 @@ describe('RemoteConnectionsDialog', () => {
       expect(selectConnection).toHaveBeenCalledWith('remote-1')
       expect(reloadApp).toHaveBeenCalled()
     })
+    // Web clients never hit the remote directly; the browser holds no remote
+    // token and there is no id yet to relay through the proxy.
+    expect(fetchRemoteServerInfo).not.toHaveBeenCalled()
+    expect(probeConnectionServerInfo).not.toHaveBeenCalled()
   })
 
-  it('shows local version and still connects when remote mismatches', async () => {
+  it('probes the remote and still connects on mismatch when adding in the native app', async () => {
+    isNativeApp.mockReturnValue(true)
     fetchRemoteServerInfo.mockResolvedValueOnce({
       ok: true,
       appVersion: '0.2.0',
@@ -142,16 +162,49 @@ describe('RemoteConnectionsDialog', () => {
     expect(screen.getByText('v0.1.69')).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: 'Add remote' }))
+    // Native add defaults to the SSH install tab; switch to the URL tab.
+    fireEvent.click(screen.getByRole('tab', { name: /Existing URL/i }))
     fireEvent.change(screen.getByLabelText('Web Access URL'), {
       target: { value: 'https://jean.example.com/?token=secret' },
     })
     fireEvent.click(screen.getByRole('button', { name: 'Save & Connect' }))
 
     await waitFor(() => {
+      expect(fetchRemoteServerInfo).toHaveBeenCalledWith(
+        'https://jean.example.com',
+        'secret'
+      )
       expect(warnRemoteVersionMismatch).toHaveBeenCalledWith('0.2.0')
       expect(addRemoteConnection).toHaveBeenCalled()
       expect(selectConnection).toHaveBeenCalledWith('remote-1')
       expect(reloadApp).toHaveBeenCalled()
+    })
+  })
+
+  it('does not pre-fill the saved token when editing and keeps it blank in the PUT (web)', async () => {
+    useRemoteConnections.mockReturnValue([
+      {
+        id: 'conn-1',
+        name: 'ses-temps',
+        url: 'https://jean.example.com',
+      },
+    ])
+
+    render(<RemoteConnectionsDialog reloadApp={vi.fn()} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Jean connections' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Edit ses-temps' }))
+
+    // The write-only token field must never be pre-filled with a saved token.
+    expect(screen.getByLabelText('Access token')).toHaveValue('')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => {
+      expect(updateRemoteConnection).toHaveBeenCalledWith(
+        'conn-1',
+        expect.objectContaining({ token: '' })
+      )
     })
   })
 
