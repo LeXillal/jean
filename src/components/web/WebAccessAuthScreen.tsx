@@ -28,8 +28,16 @@ export function WebAccessAuthScreen({
   const [token, setToken] = useState('')
   const [emptyError, setEmptyError] = useState(false)
   const [submitting, setSubmitting] = useState(false)
+  // The refused-token message describes the previous submission; drop it as
+  // soon as the user starts editing a replacement.
+  const [edited, setEdited] = useState(false)
 
   const host = serverLabel()
+  const fieldError = emptyError
+    ? "Enter the access token from Jean's Web Access settings."
+    : reason === 'rejected' && !edited
+      ? authError
+      : null
 
   const handleSubmit = (event: FormEvent) => {
     event.preventDefault()
@@ -77,25 +85,19 @@ export function WebAccessAuthScreen({
             onChange={event => {
               setToken(event.target.value)
               if (emptyError) setEmptyError(false)
+              if (!edited) setEdited(true)
             }}
             placeholder="Paste your Jean access token"
-            aria-describedby={
-              reason === 'rejected' ? 'web-access-token-error' : undefined
-            }
-            aria-invalid={reason === 'rejected' || emptyError}
+            aria-describedby={fieldError ? 'web-access-token-error' : undefined}
+            aria-invalid={!!fieldError}
           />
-          {emptyError && (
-            <p className="text-xs text-destructive">
-              Enter the access token from Jean&apos;s Web Access settings.
-            </p>
-          )}
-          {reason === 'rejected' && !emptyError && (
+          {fieldError && (
             <p
               id="web-access-token-error"
               role="alert"
               className="text-xs text-destructive"
             >
-              {authError}
+              {fieldError}
             </p>
           )}
         </div>

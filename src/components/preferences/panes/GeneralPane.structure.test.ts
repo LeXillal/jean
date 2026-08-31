@@ -246,9 +246,10 @@ describe('GeneralPane settings structure', () => {
     expect(sectionIndex).toBeGreaterThan(-1)
 
     // The control must be gated on web access: the desktop app manages its
-    // connection from the title bar, not from a token in localStorage.
-    const guard = source.slice(sectionIndex - 400, sectionIndex)
-    expect(guard).toContain('isWebAccessView')
+    // connection from the title bar, not from a token in localStorage. Match
+    // the exact guard expression so an inverted or loosened condition fails.
+    const guard = source.slice(Math.max(0, sectionIndex - 400), sectionIndex)
+    expect(guard).toContain('isGeneralScope && isWebAccessView && (')
     expect(source).toContain('signOutOfWebAccess')
   })
 })

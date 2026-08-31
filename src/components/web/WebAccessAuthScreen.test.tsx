@@ -76,6 +76,28 @@ describe('WebAccessAuthScreen', () => {
     )
   })
 
+  it('clears the refused-token alert once the user edits the field', () => {
+    render(
+      <WebAccessAuthScreen
+        authError="That access token was refused."
+        reason="rejected"
+        onTokenSubmit={vi.fn()}
+      />
+    )
+
+    fireEvent.change(screen.getByLabelText(/access token/i), {
+      target: { value: 'fresh-token' },
+    })
+
+    // The alert described the previous submission — a fresh entry has not
+    // failed at anything yet.
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.getByLabelText(/access token/i)).toHaveAttribute(
+      'aria-invalid',
+      'false'
+    )
+  })
+
   it('always offers the token form — submitting reloads, which is how a lost connection recovers', () => {
     render(
       <WebAccessAuthScreen
