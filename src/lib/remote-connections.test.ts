@@ -152,6 +152,46 @@ describe('remote connections', () => {
     expect(updated.sshPort).toBeUndefined()
   })
 
+  it('keeps the stored token when an edit omits it (write-only field)', async () => {
+    const { addRemoteConnection, getRemoteConnections, updateRemoteConnection } =
+      await loadModule()
+
+    const remote = await addRemoteConnection({
+      name: 'Build server',
+      url: 'https://jean.example.com?token=first',
+      token: '',
+    })
+    expect(remote.token).toBe('first')
+
+    // No new token entered → the stored one must be preserved.
+    const updated = await updateRemoteConnection(remote.id, {
+      name: 'Production',
+      url: remote.url,
+      token: '',
+    })
+    expect(updated.token).toBe('first')
+    expect(getRemoteConnections()[0]?.token).toBe('first')
+  })
+
+  it('overwrites the stored token only when a new one is entered', async () => {
+    const { addRemoteConnection, getRemoteConnections, updateRemoteConnection } =
+      await loadModule()
+
+    const remote = await addRemoteConnection({
+      name: 'Build server',
+      url: 'https://jean.example.com?token=first',
+      token: '',
+    })
+
+    const updated = await updateRemoteConnection(remote.id, {
+      name: 'Production',
+      url: remote.url,
+      token: 'second',
+    })
+    expect(updated.token).toBe('second')
+    expect(getRemoteConnections()[0]?.token).toBe('second')
+  })
+
   describe('web mode (server-side connection store)', () => {
     const serverEntry = {
       id: 'srv-1',
@@ -179,6 +219,23 @@ describe('remote connections', () => {
 
       expect(module.getRemoteConnections()).toEqual([serverEntry])
       expect(module.getActiveRemoteConnection()).toEqual(serverEntry)
+    })
+
+    it('accepts server entries without a token (masked by the origin hub)', async () => {
+      const masked = {
+        id: 'srv-2',
+        name: 'jean',
+        url: 'http://192.168.1.78:3456',
+      }
+      fetchMock.mockResolvedValueOnce(jsonResponse([masked]))
+
+      const module = await loadModule()
+      await module.initRemoteConnections()
+
+      // The token is masked out of GET responses; the entry must survive
+      // normalization instead of being filtered away.
+      expect(module.getRemoteConnections()).toEqual([masked])
+      expect(module.getRemoteConnections()[0]).not.toHaveProperty('token')
     })
 
     it('resolves the saved selection to local until the server list arrives', async () => {

@@ -17,7 +17,11 @@ import { generateId } from './uuid'
 import { isServerWindows } from './platform'
 import { getActiveRemoteConnection } from './remote-connections'
 import { prepareRemoteEditorOpenArgs } from './remote-editor'
-import { warnRemoteVersionMismatch } from './remote-version'
+import {
+  fetchRemoteServerInfoFromAuthUrl,
+  warnRemoteVersionMismatch,
+  type RemoteServerInfo,
+} from './remote-version'
 
 /**
  * Why the browser session is not authenticated yet.
@@ -33,13 +37,40 @@ export function usesWebSocketBackend(): boolean {
   return !isNativeApp() || getActiveRemoteConnection() !== null
 }
 
+/**
+ * Base URL for backend HTTP/WS requests in web-backend mode.
+ *
+ * - Local web (no remote): the origin hub itself.
+ * - Web + remote: relayed through the origin hub proxy at `/remote/<id>`.
+ *   The browser never holds the remote's own URL/token; the hub relays with
+ *   the hub token only.
+ * - Native app + remote: direct access to the remote's own URL (unchanged).
+ */
 function getWebBackendBaseUrl(): string {
-  return getActiveRemoteConnection()?.url ?? window.location.origin
+  const remote = getActiveRemoteConnection()
+  if (!remote) return window.location.origin
+  // Native desktop keeps its direct connection to the remote server.
+  if (isNativeApp()) return remote.url
+  // Web clients relay everything through the origin hub proxy.
+  return `${window.location.origin}/remote/${remote.id}`
+}
+
+/**
+ * Base URL for building `/api/...` asset URLs.
+ *
+ * Mirrors {@link getWebBackendBaseUrl} but stays relative ('') in local web
+ * mode so same-origin asset URLs remain relative (no behavior change).
+ */
+function getWebAssetBaseUrl(): string {
+  return getActiveRemoteConnection() ? getWebBackendBaseUrl() : ''
 }
 
 function getWebBackendToken(): string {
   const remote = getActiveRemoteConnection()
-  if (remote) return remote.token
+  // Native desktop connecting directly to a remote uses the remote's own token.
+  if (remote && isNativeApp()) return remote.token ?? ''
+  // Web mode (local or remote via proxy): always the hub token. The remote's
+  // token is never exposed to the browser anymore.
   const urlToken = new URLSearchParams(window.location.search).get('token')
   return urlToken || localStorage.getItem('jean-http-token') || ''
 }
@@ -47,6 +78,39 @@ function getWebBackendToken(): string {
 function backendUrl(path: string): string {
   const base = `${getWebBackendBaseUrl().replace(/\/+$/, '')}/`
   return new URL(path.replace(/^\/+/, ''), base).toString()
+}
+
+/**
+ * Build the proxied `/api/auth` probe URL for a registered remote connection.
+ *
+ * Web clients no longer hold the remote's token, so version probes must go
+ * through the origin hub proxy with the hub token.
+ */
+export function proxiedRemoteAuthUrl(id: string): string {
+  const token = getWebBackendToken()
+  const base = `${window.location.origin}/remote/${id}/`
+  const authUrl = new URL('api/auth', base)
+  if (token) authUrl.searchParams.set('token', token)
+  return authUrl.toString()
+}
+
+/**
+ * Probe a registered remote connection's server info, choosing the right
+ * transport: native desktop talks to the remote directly with its own token;
+ * web clients relay through the origin hub proxy with the hub token.
+ */
+export async function probeConnectionServerInfo(connection: {
+  id: string
+  url: string
+  token?: string
+}): Promise<RemoteServerInfo> {
+  if (isNativeApp()) {
+    const base = `${connection.url.replace(/\/+$/, '')}/`
+    const authUrl = new URL('api/auth', base)
+    if (connection.token) authUrl.searchParams.set('token', connection.token)
+    return fetchRemoteServerInfoFromAuthUrl(authUrl.toString())
+  }
+  return fetchRemoteServerInfoFromAuthUrl(proxiedRemoteAuthUrl(connection.id))
 }
 
 function fetchBackend(url: string): Promise<Response> {
@@ -139,7 +203,7 @@ export function convertFileSrc(filePath: string, protocol = 'asset'): string {
   // Browser mode: convert server filesystem path to /api/files/ URL
   const token = getWebBackendToken()
   const params = token ? `?token=${encodeURIComponent(token)}` : ''
-  const base = getActiveRemoteConnection()?.url ?? ''
+  const base = getWebAssetBaseUrl()
 
   // Try exact prefix match with cached app data dir
   if (_appDataDir && filePath.startsWith(_appDataDir)) {
@@ -173,7 +237,7 @@ export function convertProjectFileSrc(filePath: string): string {
 
   const token = getWebBackendToken()
   const params = token ? `?token=${encodeURIComponent(token)}` : ''
-  const base = getActiveRemoteConnection()?.url ?? ''
+  const base = getWebAssetBaseUrl()
   return `${base}/api/project-files/${encodeURIComponent(filePath)}${params}`
 }
 
@@ -611,15 +675,16 @@ class WsTransport {
     )
       return
 
+    // Native desktop pointing directly at a remote uses the remote's own token;
+    // every web client (local or remote via proxy) uses the hub token.
     const remote = getActiveRemoteConnection()
-    // Read token from URL query param or localStorage
+    const isDirectNativeRemote = Boolean(remote) && isNativeApp()
+    const token = getWebBackendToken()
     const urlToken = new URLSearchParams(window.location.search).get('token')
-    const token =
-      remote?.token || urlToken || localStorage.getItem('jean-http-token') || ''
 
     // A hub token in the URL must not become a long-lived, XSS-readable
     // localStorage entry (nor keep riding in the WS/auth query string).
-    if (!remote && urlToken) {
+    if (!isDirectNativeRemote && urlToken) {
       // Strip the token from the URL first (history/bookmark hygiene), so the
       // post-exchange reload lands on a clean URL and cannot loop.
       const url = new URL(window.location.href)

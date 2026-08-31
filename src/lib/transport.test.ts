@@ -109,6 +109,25 @@ async function loadRemoteNativeTransportModule(
   return import('./transport')
 }
 
+async function loadRemoteWebTransportModule(remote: {
+  id: string
+  name: string
+  url: string
+  token?: string
+}) {
+  vi.resetModules()
+  vi.doMock('./environment', () => ({
+    isNativeApp: () => false,
+    isNativeOpenAllowed: () => false,
+    setWsConnected: setWsConnectedMock,
+    setWebAccessEnabled: vi.fn(),
+  }))
+  vi.doMock('./remote-connections', () => ({
+    getActiveRemoteConnection: () => remote,
+  }))
+  return import('./transport')
+}
+
 describe('transport bootstrap', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -136,6 +155,9 @@ describe('transport bootstrap', () => {
     vi.doUnmock('@tauri-apps/api/core')
     vi.doUnmock('@tauri-apps/api/event')
     vi.doUnmock('./remote-connections')
+    // Restore the inert localStorage default so a hub-token test cannot leak
+    // its value into later tests.
+    vi.mocked(localStorage.getItem).mockReturnValue(null)
   })
 
   it('routes native shared commands to the selected remote Jean', async () => {
@@ -161,6 +183,39 @@ describe('transport bootstrap', () => {
     const sent = JSON.parse(String(ws.send.mock.calls.at(-1)?.[0]))
     ws.receive({ type: 'response', id: sent.id, data: [] })
     await request
+  })
+
+  it('relays web remote traffic through the origin hub proxy with the hub token only', async () => {
+    vi.mocked(localStorage.getItem).mockImplementation(key =>
+      key === 'jean-http-token' ? 'hubtoken' : null
+    )
+    const transport = await loadRemoteWebTransportModule({
+      id: 'remote-1',
+      name: 'Server',
+      // Direct URL and remote token must never reach the browser transport.
+      url: 'https://direct.example.com',
+      token: 'remoteToken',
+    })
+
+    transport.connectTransport()
+    await waitFor(() => expect(MockWebSocket.instances.length).toBe(1))
+    await flushAsync()
+    const ws = getWs(0)
+
+    const origin = window.location.origin
+    const wsHost = origin.replace(/^http/, 'ws')
+    expect(ws.url).toBe(`${wsHost}/remote/remote-1/ws?token=hubtoken`)
+    expect(ws.url).not.toContain('remoteToken')
+    expect(ws.url).not.toContain('direct.example.com')
+
+    expect(fetch).toHaveBeenCalledWith(
+      `${origin}/remote/remote-1/api/auth?token=hubtoken`,
+      expect.objectContaining({ signal: expect.anything() })
+    )
+    const authCall = vi
+      .mocked(fetch)
+      .mock.calls.find(call => String(call[0]).includes('/api/auth'))
+    expect(String(authCall?.[0])).not.toContain('remoteToken')
   })
 
   it('keeps native menu listeners on the local shell for remote connections', async () => {
