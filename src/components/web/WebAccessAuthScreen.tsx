@@ -3,6 +3,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import type { WsAuthReason } from '@/lib/transport'
+import { webAccessServerLabel } from '@/lib/environment'
 
 interface WebAccessAuthScreenProps {
   authError: string
@@ -11,13 +12,6 @@ interface WebAccessAuthScreenProps {
    * reloads the page, which is also how a lost connection recovers. */
   reason?: Exclude<WsAuthReason, 'unreachable'>
   onTokenSubmit: (token: string) => void
-}
-
-/** Host the token unlocks, so people running several Jean servers can tell
- * which one is asking. Falls back to nothing rather than guessing. */
-function serverLabel(): string {
-  if (typeof window === 'undefined') return ''
-  return window.location.host
 }
 
 export function WebAccessAuthScreen({
@@ -32,7 +26,7 @@ export function WebAccessAuthScreen({
   // soon as the user starts editing a replacement.
   const [edited, setEdited] = useState(false)
 
-  const host = serverLabel()
+  const host = webAccessServerLabel()
   const fieldError = emptyError
     ? "Enter the access token from Jean's Web Access settings."
     : reason === 'rejected' && !edited
