@@ -559,6 +559,8 @@ class WsTransport {
   private connectRetryAttempt = 0
   private connectRetryTimer: ReturnType<typeof setTimeout> | null = null
   private connectWatchdog: ReturnType<typeof setTimeout> | null = null
+  /** Fires once a socket has stayed open long enough to count as healthy. */
+  private stabilityTimer: ReturnType<typeof setTimeout> | null = null
   /** Periodic check that we're seeing inbound traffic from the server.
    *  The server sends app-level heartbeats every 20s because browser JS cannot
    *  observe protocol ping/pong frames, so a 50s gap means the connection is dead. */
@@ -578,8 +580,11 @@ class WsTransport {
   private _connecting = false
   private _authError: string | null = null
   private _subscribers = new Set<() => void>()
-  private _establishedDisconnectListeners = new Set<() => void>()
   private _connectEnabled = false
+  /** Set by {@link dispose}; nothing may reopen a socket afterwards. */
+  private _disposed = false
+  /** True while this transport is the one that set the global connected flag. */
+  private _drivesGlobalState = false
   /** Track last seen sequence numbers to deduplicate bootstrap replay. */
   private _lastSeqBySession = new Map<string, number>()
   /** Track terminal sequence numbers for explicit full-refresh replay. */
@@ -638,12 +643,24 @@ class WsTransport {
 
   private setConnected(value: boolean): void {
     this._connected = value
-    if (this.isFocused) setWsConnected(value)
+    // Push the global flag down only if this transport is the one that raised
+    // it. Reading `isFocused` on both edges would strand `setWsConnected(true)`
+    // if focus moved between open and close.
+    if (value ? this.isFocused : this._drivesGlobalState) {
+      this._drivesGlobalState = value
+      setWsConnected(value)
+    }
     this.notifySubscribers()
   }
 
   private setAuthError(error: string | null): void {
     this._authError = error
+    this.notifySubscribers()
+  }
+
+  /** `_connecting` and the socket's CONNECTING state feed {@link status}. */
+  private setConnecting(value: boolean): void {
+    this._connecting = value
     this.notifySubscribers()
   }
 
@@ -656,8 +673,10 @@ class WsTransport {
 
   /** Tear down sockets/timers for a connection that no longer exists. */
   dispose(): void {
+    this._disposed = true
     this._connectEnabled = false
     this.clearConnectWatchdog()
+    this.clearStabilityTimer()
     this.stopLivenessTimer()
     if (this.connectRetryTimer) {
       clearTimeout(this.connectRetryTimer)
@@ -676,17 +695,20 @@ class WsTransport {
     this.ws = null
     this.listeners.clear()
     this.eventBuffer.clear()
+    // Fail callers now instead of leaving them on the 60s command timeout, and
+    // drop anything queued so a disposed transport cannot replay it.
+    for (const [, pending] of this.pending.entries()) {
+      clearTimeout(pending.timeout)
+      pending.reject(new Error('Connection was removed'))
+    }
+    this.pending.clear()
+    this.queue = []
   }
 
   /** Subscribe to state changes. Returns an unsubscribe function. */
   subscribe(callback: () => void): () => void {
     this._subscribers.add(callback)
     return () => this._subscribers.delete(callback)
-  }
-
-  onEstablishedDisconnect(callback: () => void): () => void {
-    this._establishedDisconnectListeners.add(callback)
-    return () => this._establishedDisconnectListeners.delete(callback)
   }
 
   /** Get current connection snapshot for useSyncExternalStore. */
@@ -701,7 +723,7 @@ class WsTransport {
 
   /** Connect to the WebSocket server (validates token first). */
   connect(): void {
-    if (!this._connectEnabled) return
+    if (!this._connectEnabled || this._disposed) return
     // The FOCUSED transport recovers through a full page reload, never a
     // second in-memory WebSocket connection: the bootstrap is what rebuilds
     // in-flight streams and replay sequences. Satellites carry no such state,
@@ -736,10 +758,10 @@ class WsTransport {
       }
     }
 
-    this._connecting = true
+    this.setConnecting(true)
 
     this.validateAndConnect(token).finally(() => {
-      this._connecting = false
+      this.setConnecting(false)
     })
   }
 
@@ -759,6 +781,15 @@ class WsTransport {
     try {
       const res = await fetchBackendFor(remote, authUrl)
       if (!res.ok) {
+        // A satellite has no UI to prompt with, so it must tell "refused" from
+        // "not answering". Only 401/403 is a credential problem worth stopping
+        // for; anything else (a 502 from the proxy when the remote is down) is
+        // transient and has to keep retrying, or the instance never returns.
+        if (!this.isFocused && res.status !== 401 && res.status !== 403) {
+          this.setAuthError(null)
+          this.scheduleConnectRetry()
+          return
+        }
         // Invalid token — clear it and wait for the user to provide another.
         // Only the focused transport may do this: a satellite must not sign
         // the whole app out because one secondary instance refused it.
@@ -784,18 +815,24 @@ class WsTransport {
         }
       }
     } catch {
-      if (remote) {
+      if (remote && this.isFocused) {
         this.setAuthError(
           "Jean could not reach the server's authentication endpoint. Check that the server is running and the URL and port are correct. If the address opens in a browser, update and restart the remote Jean server so it allows desktop connections (CORS)."
         )
         return
       }
-      // The initial page load may race server startup. Retry connecting until
-      // the first successful socket; established sockets use a page reload.
+      // The initial page load may race server startup, and a satellite's server
+      // can go down at any time. Both retry: an unreachable server is not an
+      // auth failure, and setting one here would stop the retry loop for good.
       this.setAuthError(null)
       this.scheduleConnectRetry()
       return
     }
+
+    // The connection may have been deleted while the probe was in flight; its
+    // transport is gone from the registry, so a socket opened now could never
+    // be closed — and would resolve to the hub, not to the removed remote.
+    if (this._disposed || !this._connectEnabled) return
 
     // Token valid (or not required) — clear any previous auth error and connect
     this.setAuthError(null)
@@ -829,7 +866,16 @@ class WsTransport {
       this.startLivenessTimer()
       this._hasConnectedOnce = true
       this.setConnected(true)
-      this.connectRetryAttempt = 0
+      // Do NOT clear the backoff here. The hub accepts the WebSocket upgrade
+      // before it knows whether the remote is reachable, so a dead remote
+      // produces open-then-immediately-close. Resetting on open would pin the
+      // delay at 100ms forever and hammer the hub — and through it, the remote.
+      // Only a connection that stayed up counts as proven.
+      this.clearStabilityTimer()
+      this.stabilityTimer = setTimeout(() => {
+        this.stabilityTimer = null
+        this.connectRetryAttempt = 0
+      }, WsTransport.STABLE_CONNECTION_MS)
 
       // Flush queued messages
       for (const item of this.queue) {
@@ -858,9 +904,12 @@ class WsTransport {
     this.ws.onclose = () => {
       const wasConnected = this._connected
 
-      // Only the focused transport triggers the app-level reload path.
-      if (wasConnected && this.isFocused) {
-        for (const callback of this._establishedDisconnectListeners) {
+      // Only the transport that drove the app triggers the reload path. The
+      // listeners live on the registry, not on this instance: App.tsx
+      // subscribes during its first render, before the connection list has
+      // loaded, when the focused id still reads as 'local'.
+      if (wasConnected && this._drivesGlobalState) {
+        for (const callback of establishedDisconnectListeners) {
           try {
             callback()
           } catch (error) {
@@ -873,6 +922,7 @@ class WsTransport {
       }
 
       this.clearConnectWatchdog()
+      this.clearStabilityTimer()
       this.stopLivenessTimer()
       this.ws = null
 
@@ -940,6 +990,8 @@ class WsTransport {
   private static readonly LONG_TIMEOUT = 30 * 60_000
   private static readonly DEFAULT_TIMEOUT = 60_000
   private static readonly CONNECT_TIMEOUT = 12_000
+  /** How long a socket must stay open before its backoff counter is cleared. */
+  private static readonly STABLE_CONNECTION_MS = 10_000
   private static readonly MAX_QUEUE_SIZE = 500
   /** If no inbound traffic for this long, assume connection is dead.
    *  Must exceed the server's app-level heartbeat interval (20s); protocol
@@ -1092,6 +1144,24 @@ class WsTransport {
         pending.reject(new Error(msg.error || 'Unknown error'))
       }
     } else if (msg.type === 'event' && msg.event) {
+      // A satellite subscribes to a couple of list-level events, but the server
+      // broadcasts everything to every client. Drop what nobody is listening
+      // for instead of buffering it: replay dedup and the listener-gap buffer
+      // only matter for the transport that drives the app, and unbounded
+      // per-session sequence tracking on a firehose is pure leak.
+      if (!this.isFocused) {
+        const satelliteHandlers = this.listeners.get(msg.event)
+        if (!satelliteHandlers?.size) return
+        for (const handler of satelliteHandlers) {
+          try {
+            handler({ payload: msg.payload })
+          } catch (e) {
+            console.error(`[WsTransport] Error in '${msg.event}' handler:`, e)
+          }
+        }
+        return
+      }
+
       // Track sequence numbers for bootstrap/live overlap deduplication.
       if (msg.seq != null && msg.payload) {
         const payload = msg.payload as Record<string, unknown>
@@ -1168,6 +1238,12 @@ class WsTransport {
     if (!this.connectWatchdog) return
     clearTimeout(this.connectWatchdog)
     this.connectWatchdog = null
+  }
+
+  private clearStabilityTimer(): void {
+    if (!this.stabilityTimer) return
+    clearTimeout(this.stabilityTimer)
+    this.stabilityTimer = null
   }
 
   private startLivenessTimer(): void {
@@ -1267,6 +1343,14 @@ class WsTransport {
  */
 const transports = new Map<string, WsTransport>()
 const registrySubscribers = new Set<() => void>()
+/**
+ * App-level "the connection I was using just dropped" callbacks.
+ *
+ * Registry-scoped on purpose: subscribers register at first render, while the
+ * connection list is still loading and the focused id has not resolved yet, so
+ * binding them to a particular transport would attach them to the wrong one.
+ */
+const establishedDisconnectListeners = new Set<() => void>()
 let registryVersion = 0
 
 function notifyTransportRegistry(): void {
@@ -1424,9 +1508,12 @@ export function connectTransport(): void {
   focusedTransport().enableConnect()
 }
 
-/** Run immediately when an established browser WebSocket disconnects. */
+/** Run immediately when the established browser WebSocket in use disconnects. */
 export function onEstablishedWsDisconnect(callback: () => void): () => void {
-  return focusedTransport().onEstablishedDisconnect(callback)
+  establishedDisconnectListeners.add(callback)
+  return () => {
+    establishedDisconnectListeners.delete(callback)
+  }
 }
 
 /**

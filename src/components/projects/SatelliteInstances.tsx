@@ -67,8 +67,13 @@ interface SatelliteInstancesProps {
  */
 export function SatelliteInstances({ ready }: SatelliteInstancesProps) {
   const instances = useInstances()
+  // Empty on native so the fan-out below issues no queries at all: `invokeOn`
+  // would otherwise build a WebSocket transport per registered remote that can
+  // never connect, leaking its wake listeners and hanging on the command
+  // timeout — all for a component that renders null here.
   const satellites = useMemo(
-    () => instances.filter(instance => !instance.isFocused),
+    () =>
+      isNativeApp() ? [] : instances.filter(instance => !instance.isFocused),
     [instances]
   )
 

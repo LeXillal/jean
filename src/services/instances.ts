@@ -128,26 +128,48 @@ export interface PendingSessionOpen {
  */
 export function setPendingSessionOpen(target: PendingSessionOpen): void {
   if (typeof window === 'undefined') return
-  window.sessionStorage.setItem(PENDING_OPEN_KEY, JSON.stringify(target))
+  window.sessionStorage.setItem(
+    PENDING_OPEN_KEY,
+    JSON.stringify({ ...target, requestedAt: Date.now() })
+  )
 }
 
+/** A switch that has not completed within this window is abandoned. */
+const PENDING_OPEN_TTL_MS = 60_000
+
 /**
- * Read and clear the pending target, but only when it belongs to the instance
- * now in focus — a stale entry must never open a session on the wrong server.
+ * Read the pending target, but only when it belongs to the instance now in
+ * focus — it must never open a session on the wrong server.
+ *
+ * A target for another instance is deliberately kept: the switch it belongs to
+ * may still be in flight, and consuming it here would silently make the click
+ * do nothing. The timestamp bounds how long that can last.
  */
 export function consumePendingSessionOpen(): PendingSessionOpen | null {
   if (typeof window === 'undefined') return null
   const raw = window.sessionStorage.getItem(PENDING_OPEN_KEY)
   if (!raw) return null
-  window.sessionStorage.removeItem(PENDING_OPEN_KEY)
+
+  let parsed: (PendingSessionOpen & { requestedAt?: number }) | null = null
   try {
-    const parsed = JSON.parse(raw) as PendingSessionOpen
-    if (!parsed?.sessionId || !parsed.worktreeId) return null
-    if (parsed.instanceId !== getActiveConnectionId()) return null
-    return parsed
+    parsed = JSON.parse(raw)
   } catch {
+    window.sessionStorage.removeItem(PENDING_OPEN_KEY)
     return null
   }
+
+  if (!parsed?.sessionId || !parsed.worktreeId) {
+    window.sessionStorage.removeItem(PENDING_OPEN_KEY)
+    return null
+  }
+  if (Date.now() - (parsed.requestedAt ?? 0) > PENDING_OPEN_TTL_MS) {
+    window.sessionStorage.removeItem(PENDING_OPEN_KEY)
+    return null
+  }
+  if (parsed.instanceId !== getActiveConnectionId()) return null
+
+  window.sessionStorage.removeItem(PENDING_OPEN_KEY)
+  return parsed
 }
 
 /**
