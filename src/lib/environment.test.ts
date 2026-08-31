@@ -52,12 +52,12 @@ describe('environment detection', () => {
     expect(hasBackend()).toBe(true)
   })
 
-  it('treats a native shell on a remote connection as non-local backend', () => {
+  it('treats a native shell on a remote connection as non-local backend', async () => {
     Object.defineProperty(window, '__TAURI_INTERNALS__', {
       configurable: true,
       value: { invoke: vi.fn() },
     })
-    const remote = addRemoteConnection({
+    const remote = await addRemoteConnection({
       name: 'Remote host',
       url: 'https://remote.example.com',
       token: 'test-token',
@@ -78,12 +78,12 @@ describe('environment detection', () => {
     expect(canOpenInEditor()).toBe(true)
   })
 
-  it('prefers host-native open over local ssh:// remap when remote allows it', () => {
+  it('prefers host-native open over local ssh:// remap when remote allows it', async () => {
     Object.defineProperty(window, '__TAURI_INTERNALS__', {
       configurable: true,
       value: { invoke: vi.fn() },
     })
-    const remote = addRemoteConnection({
+    const remote = await addRemoteConnection({
       name: 'WSL Jean',
       url: 'http://127.0.0.1:3456',
       token: 'test-token',
