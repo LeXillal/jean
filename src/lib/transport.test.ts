@@ -683,7 +683,7 @@ describe('transport bootstrap', () => {
 // Multi-instance transport registry
 // ---------------------------------------------------------------------------
 
-const SAT_A ={ id: 'sat-a', name: 'Server A', url: 'https://a.example.com' }
+const SAT_A = { id: 'sat-a', name: 'Server A', url: 'https://a.example.com' }
 const SAT_B = { id: 'sat-b', name: 'Server B', url: 'https://b.example.com' }
 
 /**

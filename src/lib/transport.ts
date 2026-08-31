@@ -1343,9 +1343,20 @@ class WsTransport {
  */
 const transports = new Map<string, WsTransport>()
 const registrySubscribers = new Set<() => void>()
+let registryVersion = 0
 
 function notifyTransportRegistry(): void {
+  registryVersion++
   for (const cb of registrySubscribers) cb()
+}
+
+/**
+ * Monotonic counter bumped on every transport state change. A number is a
+ * stable `useSyncExternalStore` snapshot; the statuses themselves are derived
+ * from it, which a freshly-built array could not be.
+ */
+export function getTransportRegistryVersion(): number {
+  return registryVersion
 }
 
 /** Subscribe to any transport's state change (connection, auth, focus). */
