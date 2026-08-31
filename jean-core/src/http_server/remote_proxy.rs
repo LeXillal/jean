@@ -175,6 +175,58 @@ pub(super) fn remote_targets_self(remote_url: &str, own_host: &str, own_port: u1
     is_loopback_host(host) && is_loopback_host(own_host)
 }
 
+/// True when a plaintext (`http`/`ws`) hop to `host` stays on a trusted local
+/// network — loopback, an RFC1918 private range, link-local, or the CGNAT/tailnet
+/// range (`100.64.0.0/10`). Public IPs and any non-IP hostname are NOT trusted
+/// for plaintext (we can't be sure they stay off the open internet), so they
+/// require TLS. IP literals only: a hostname could resolve anywhere.
+fn plaintext_host_is_trusted(host: &str) -> bool {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return ip_is_private_or_loopback(&ip);
+    }
+    // "localhost" is the one name we can trust without DNS.
+    host.eq_ignore_ascii_case("localhost")
+}
+
+fn ip_is_private_or_loopback(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            let is_cgnat = o[0] == 100 && (64..=127).contains(&o[1]); // 100.64/10
+            v4.is_loopback() || v4.is_private() || v4.is_link_local() || is_cgnat
+        }
+        std::net::IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            let is_unique_local = (first & 0xfe00) == 0xfc00; // fc00::/7
+            let is_link_local = (first & 0xffc0) == 0xfe80; // fe80::/10
+            v6.is_loopback() || is_unique_local || is_link_local
+        }
+    }
+}
+
+/// Reject a remote whose URL sends the injected bearer token over plaintext
+/// (`http`/`ws`) to a non-private host — that would leak the token on the wire
+/// the moment the hop crosses an untrusted network. `https`/`wss` and plaintext
+/// on a private/loopback network are allowed. Unparseable URLs pass here and
+/// fail later in the URL builder.
+fn reject_untrusted_plaintext(remote_url: &str) -> Result<(), String> {
+    let Ok(url) = reqwest::Url::parse(remote_url) else {
+        return Ok(());
+    };
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "ws" {
+        return Ok(());
+    }
+    let host = url.host_str().unwrap_or_default();
+    if plaintext_host_is_trusted(host) {
+        Ok(())
+    } else {
+        Err(format!(
+            "remote host '{host}' uses {scheme}:// on a non-private address; use https/wss (plaintext is only allowed on a loopback or private network)"
+        ))
+    }
+}
+
 // ── HTTP proxy handler ───────────────────────────────────────────────────────
 
 pub(super) async fn remote_http_proxy_handler(
@@ -206,6 +258,12 @@ pub(super) async fn remote_http_proxy_handler(
     // (c) Anti-loop.
     if remote_targets_self(&entry.url, &state.own_host, state.own_port) {
         return (StatusCode::BAD_REQUEST, "Remote targets this hub").into_response();
+    }
+
+    // (c') Refuse plaintext to a public host — the bearer token would leak on
+    // the wire. https/wss and plaintext on a private network are fine.
+    if let Err(message) = reject_untrusted_plaintext(&entry.url) {
+        return (StatusCode::BAD_REQUEST, message).into_response();
     }
 
     // (d) Build the upstream URL. The remote token is NOT in the URL — it goes
@@ -293,6 +351,11 @@ pub(super) async fn remote_ws_proxy_handler(
 
     if remote_targets_self(&entry.url, &state.own_host, state.own_port) {
         return (StatusCode::BAD_REQUEST, "Remote targets this hub").into_response();
+    }
+
+    // Refuse plaintext ws to a public host — the bearer token would leak.
+    if let Err(message) = reject_untrusted_plaintext(&entry.url) {
+        return (StatusCode::BAD_REQUEST, message).into_response();
     }
 
     let upstream_url = match build_upstream_ws_url(&entry.url) {
@@ -458,6 +521,43 @@ mod tests {
     #[test]
     fn build_ws_url_rejects_non_http_scheme() {
         assert!(build_upstream_ws_url("ftp://x").is_err());
+    }
+
+    #[test]
+    fn plaintext_allowed_on_private_and_loopback() {
+        // LAN (RFC1918), loopback, CGNAT/tailnet, link-local over http → allowed.
+        for url in [
+            "http://192.168.1.61:3456",
+            "http://10.0.0.5:3456",
+            "http://172.16.4.2:3456",
+            "http://127.0.0.1:3456",
+            "http://localhost:3456",
+            "http://100.92.116.51:3456", // tailnet CGNAT
+            "ws://192.168.1.63:3456",
+        ] {
+            assert!(reject_untrusted_plaintext(url).is_ok(), "{url} should be allowed");
+        }
+    }
+
+    #[test]
+    fn plaintext_refused_on_public_hosts() {
+        // Public IP and any hostname over http → refused (require TLS).
+        for url in [
+            "http://8.8.8.8:3456",
+            "http://93.184.216.34",
+            "http://remote.example.com:3456",
+            "ws://remote.example.com/ws",
+        ] {
+            assert!(reject_untrusted_plaintext(url).is_err(), "{url} should be refused");
+        }
+    }
+
+    #[test]
+    fn https_always_allowed_regardless_of_host() {
+        // TLS protects the wire, so any host is fine.
+        assert!(reject_untrusted_plaintext("https://remote.example.com:8443").is_ok());
+        assert!(reject_untrusted_plaintext("https://8.8.8.8").is_ok());
+        assert!(reject_untrusted_plaintext("wss://remote.example.com/ws").is_ok());
     }
 
     #[test]
