@@ -73,6 +73,22 @@ async function loadNativeTransportModule(
   return import('./transport')
 }
 
+/**
+ * Mock the connection registry for a single selected instance. The transport
+ * resolves focus through `getActiveConnectionId()`, so the mock must keep the
+ * id, the list and the active connection consistent with each other.
+ */
+function mockRemoteConnections(
+  remote: { id: string; name: string; url: string; token?: string } | null
+) {
+  vi.doMock('./remote-connections', () => ({
+    LOCAL_CONNECTION_ID: 'local',
+    getActiveConnectionId: () => remote?.id ?? 'local',
+    getActiveRemoteConnection: () => remote,
+    getRemoteConnections: () => (remote ? [remote] : []),
+  }))
+}
+
 async function loadRemoteNativeTransportModule(
   remote?: {
     id: string
@@ -94,15 +110,14 @@ async function loadRemoteNativeTransportModule(
     setWsConnected: setWsConnectedMock,
     setWebAccessEnabled: vi.fn(),
   }))
-  vi.doMock('./remote-connections', () => ({
-    getActiveRemoteConnection: () =>
-      remote ?? {
-        id: 'remote-1',
-        name: 'Server',
-        url: 'https://jean.example.com',
-        token: 'secret',
-      },
-  }))
+  mockRemoteConnections(
+    remote ?? {
+      id: 'remote-1',
+      name: 'Server',
+      url: 'https://jean.example.com',
+      token: 'secret',
+    }
+  )
   if (tauriInvoke) {
     vi.doMock('@tauri-apps/api/core', () => ({ invoke: tauriInvoke }))
   }
@@ -122,9 +137,7 @@ async function loadRemoteWebTransportModule(remote: {
     setWsConnected: setWsConnectedMock,
     setWebAccessEnabled: vi.fn(),
   }))
-  vi.doMock('./remote-connections', () => ({
-    getActiveRemoteConnection: () => remote,
-  }))
+  mockRemoteConnections(remote)
   return import('./transport')
 }
 
@@ -663,5 +676,210 @@ describe('transport bootstrap', () => {
     getWs(0).close()
 
     expect(onDisconnect).toHaveBeenCalledOnce()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Multi-instance transport registry
+// ---------------------------------------------------------------------------
+
+const SAT_A ={ id: 'sat-a', name: 'Server A', url: 'https://a.example.com' }
+const SAT_B = { id: 'sat-b', name: 'Server B', url: 'https://b.example.com' }
+
+/**
+ * Load the transport with several registered instances and a MUTABLE focused
+ * id, so a test can switch focus the way `selectConnection()` does at runtime.
+ */
+async function loadMultiInstanceTransportModule(initialActiveId = 'local') {
+  vi.resetModules()
+  const focus = { id: initialActiveId }
+  const connections = [SAT_A, SAT_B]
+  vi.doMock('./environment', () => ({
+    isNativeApp: () => false,
+    isNativeOpenAllowed: () => false,
+    setWsConnected: setWsConnectedMock,
+    setWebAccessEnabled: vi.fn(),
+  }))
+  vi.doMock('./remote-connections', () => ({
+    LOCAL_CONNECTION_ID: 'local',
+    getActiveConnectionId: () => focus.id,
+    getActiveRemoteConnection: () =>
+      connections.find(item => item.id === focus.id) ?? null,
+    getRemoteConnections: () => connections,
+  }))
+  const transport = await import('./transport')
+  return { transport, focus }
+}
+
+describe('transport registry (multi-instance)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    MockWebSocket.instances = []
+    localStorage.clear()
+    vi.stubGlobal('WebSocket', MockWebSocket)
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ appVersion: FALLBACK_APP_VERSION }),
+      })
+    )
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.resetModules()
+  })
+
+  it('returns one stable transport per instance id', async () => {
+    const { transport } = await loadMultiInstanceTransportModule()
+
+    const first = transport.getTransport(SAT_A.id)
+
+    expect(transport.getTransport(SAT_A.id)).toBe(first)
+    expect(transport.getTransport(SAT_B.id)).not.toBe(first)
+  })
+
+  it('opens a satellite socket through the hub proxy for that instance', async () => {
+    const { transport } = await loadMultiInstanceTransportModule()
+
+    transport.ensureSatelliteTransport(SAT_A.id)
+    await flushAsync()
+
+    expect(getWs(0).url).toContain(`/remote/${SAT_A.id}/ws`)
+  })
+
+  it('routes invokeOn to the addressed instance, not the focused one', async () => {
+    const { transport } = await loadMultiInstanceTransportModule()
+
+    transport.connectTransport()
+    transport.ensureSatelliteTransport(SAT_A.id)
+    await flushAsync()
+
+    const hubWs = MockWebSocket.instances.find(
+      ws => !ws.url.includes('/remote/')
+    )
+    const satelliteWs = MockWebSocket.instances.find(ws =>
+      ws.url.includes(`/remote/${SAT_A.id}/ws`)
+    )
+    expect(hubWs).toBeDefined()
+    expect(satelliteWs).toBeDefined()
+
+    void transport.invokeOn(SAT_A.id, 'list_all_sessions')
+    await flushAsync()
+
+    expect(satelliteWs?.send).toHaveBeenCalledOnce()
+    expect(hubWs?.send).not.toHaveBeenCalled()
+    expect(String(satelliteWs?.send.mock.calls[0]?.[0])).toContain(
+      'list_all_sessions'
+    )
+  })
+
+  it('tags satellite events with the instance they came from', async () => {
+    const { transport } = await loadMultiInstanceTransportModule()
+    const handler = vi.fn()
+
+    transport.ensureSatelliteTransport(SAT_A.id)
+    await flushAsync()
+    await transport.listenOn(SAT_A.id, 'session:updated', handler)
+
+    getWs(0).receive({
+      type: 'event',
+      event: 'session:updated',
+      payload: { session_id: 's1' },
+    })
+
+    expect(handler).toHaveBeenCalledWith({
+      payload: { session_id: 's1' },
+      instanceId: SAT_A.id,
+    })
+  })
+
+  it('reconnects a satellite in place after its socket drops', async () => {
+    const { transport } = await loadMultiInstanceTransportModule()
+
+    transport.ensureSatelliteTransport(SAT_A.id)
+    await flushAsync()
+    expect(MockWebSocket.instances).toHaveLength(1)
+
+    getWs(0).close()
+    await new Promise(resolve => setTimeout(resolve, 250))
+    await flushAsync()
+
+    // The focused transport would have stopped at one socket and waited for a
+    // page reload; a satellite must come back on its own.
+    expect(MockWebSocket.instances.length).toBeGreaterThan(1)
+    expect(getWs(1).url).toContain(`/remote/${SAT_A.id}/ws`)
+  })
+
+  it('never lets a satellite drop touch global connection state', async () => {
+    const { transport } = await loadMultiInstanceTransportModule()
+    const onDisconnect = vi.fn()
+
+    transport.onEstablishedWsDisconnect(onDisconnect)
+    transport.ensureSatelliteTransport(SAT_A.id)
+    await flushAsync()
+    setWsConnectedMock.mockClear()
+
+    getWs(0).close()
+    await flushAsync()
+
+    expect(onDisconnect).not.toHaveBeenCalled()
+    expect(setWsConnectedMock).not.toHaveBeenCalled()
+  })
+
+  it('reports per-instance status for the indicator', async () => {
+    const { transport } = await loadMultiInstanceTransportModule()
+
+    expect(transport.getInstanceStatus(SAT_A.id)).toBe('idle')
+
+    transport.ensureSatelliteTransport(SAT_A.id)
+    await flushAsync()
+    expect(transport.getInstanceStatus(SAT_A.id)).toBe('connected')
+
+    getWs(0).close()
+    expect(transport.getInstanceStatus(SAT_A.id)).toBe('offline')
+  })
+
+  it('re-points bare invoke() at the newly focused instance', async () => {
+    const { transport, focus } = await loadMultiInstanceTransportModule(
+      SAT_A.id
+    )
+
+    transport.connectTransport()
+    await flushAsync()
+    const wsA = getWs(0)
+    expect(wsA.url).toContain(`/remote/${SAT_A.id}/ws`)
+
+    // Switching focus is what `selectConnection()` does; no reload involved.
+    focus.id = SAT_B.id
+    transport.connectTransport()
+    await flushAsync()
+
+    const wsB = MockWebSocket.instances.find(ws =>
+      ws.url.includes(`/remote/${SAT_B.id}/ws`)
+    )
+    expect(wsB).toBeDefined()
+
+    void transport.invoke('list_projects')
+    await flushAsync()
+
+    expect(wsB?.send).toHaveBeenCalledOnce()
+    expect(wsA.send).not.toHaveBeenCalled()
+  })
+
+  it('closes and forgets a released instance', async () => {
+    const { transport } = await loadMultiInstanceTransportModule()
+
+    transport.ensureSatelliteTransport(SAT_A.id)
+    await flushAsync()
+    const ws = getWs(0)
+    expect(transport.getLiveTransportIds()).toContain(SAT_A.id)
+
+    transport.releaseTransport(SAT_A.id)
+
+    expect(ws.close).toHaveBeenCalled()
+    expect(transport.getLiveTransportIds()).not.toContain(SAT_A.id)
+    expect(transport.getInstanceStatus(SAT_A.id)).toBe('idle')
   })
 })
