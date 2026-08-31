@@ -34,6 +34,10 @@ struct AppState {
     /// HMAC key that signs web session cookies. Shared (Arc) because AppState is
     /// cloned per request. Loaded once at startup from app-data.
     session_key: Arc<Vec<u8>>,
+    /// Allowlist of sessions permitted to authenticate. A signed cookie only
+    /// works while its `sid` is still listed here, which is what makes
+    /// per-device revocation possible.
+    sessions: Arc<std::sync::RwLock<auth::SessionStore>>,
 }
 
 /// Server handle for shutdown coordination.
@@ -213,14 +217,16 @@ pub async fn start_server(
     // Resolve the dist directory at runtime for static file serving
     let dist_path = resolve_dist_path(&app);
 
-    // Load (or create) the key that signs session cookies. Persisted in
-    // app-data so sessions survive restarts.
-    let session_key = {
+    // Load (or create) the key that signs session cookies, plus the session
+    // allowlist. Both live in app-data so sessions survive restarts.
+    let (session_key, sessions) = {
         let dir = app
             .path()
             .app_data_dir()
             .map_err(|e| format!("Failed to resolve app data dir: {e}"))?;
-        Arc::new(auth::load_or_create_session_key(&dir)?)
+        let key = Arc::new(auth::load_or_create_session_key(&dir)?);
+        let store = Arc::new(std::sync::RwLock::new(auth::SessionStore::load(&dir)));
+        (key, store)
     };
 
     let state = AppState {
@@ -230,6 +236,7 @@ pub async fn start_server(
         localhost_only,
         dist_path: dist_path.clone(),
         session_key,
+        sessions,
     };
 
     let cors = cors_layer_from_env();
@@ -368,7 +375,7 @@ async fn ws_handler(
 ) -> Response {
     // Validate token (skip if token not required)
     if state.token_required
-        && !request_is_authorized(params.token.as_deref(), &headers, &state.token, &state.session_key)
+        && !request_is_authorized(params.token.as_deref(), &headers, &state)
     {
         return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
     }
@@ -406,13 +413,35 @@ async fn auth_handler(
         .into_response();
     }
 
-    if request_is_authorized(params.token.as_deref(), &headers, &state.token, &state.session_key) {
-        Json(serde_json::json!({
+    if request_is_authorized(params.token.as_deref(), &headers, &state) {
+        let mut response = Json(serde_json::json!({
             "ok": true,
             "webBuildId": build_info.web_build_id,
             "appVersion": build_info.app_version,
         }))
-        .into_response()
+        .into_response();
+        // Sliding expiry: the browser hits this endpoint on every connect, so a
+        // session in regular use keeps getting a fresh TTL. `refresh` only acts
+        // (and only writes) once the session is past half-life.
+        if let Some(sid) = active_session_sid(&headers, &state) {
+            let now = now_unix_secs();
+            let refreshed = state
+                .sessions
+                .write()
+                .ok()
+                .and_then(|mut store| store.refresh(&sid, now));
+            if let Some(expires_at) = refreshed {
+                let cookie = session_set_cookie(
+                    &auth::issue_session_cookie(&state.session_key, &sid, expires_at),
+                    request_is_https(&headers),
+                    expires_at.saturating_sub(now),
+                );
+                if let Ok(value) = HeaderValue::from_str(&cookie) {
+                    response.headers_mut().insert(header::SET_COOKIE, value);
+                }
+            }
+        }
+        response
     } else {
         (
             StatusCode::UNAUTHORIZED,
@@ -493,18 +522,31 @@ async fn login_handler(
         )
             .into_response();
     }
-    let value = auth::issue_session_cookie(&state.session_key, now_unix_secs());
+    let now = now_unix_secs();
+    let (sid, expires_at) = {
+        let Ok(mut store) = state.sessions.write() else {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "session store poisoned").into_response();
+        };
+        store.create(auth::label_from_user_agent(&headers), now)
+    };
+    let value = auth::issue_session_cookie(&state.session_key, &sid, expires_at);
     json_ok_with_cookie(session_set_cookie(
         &value,
         request_is_https(&headers),
-        auth::SESSION_TTL_SECS,
+        expires_at.saturating_sub(now),
     ))
 }
 
-/// Clear the session cookie. The stateless design means we can only ask the
-/// browser to drop it (there is no server-side session to delete); rotating the
-/// key file is the "revoke everywhere" lever.
-async fn logout_handler(headers: HeaderMap) -> Response {
+/// Sign out: revoke this device's session server-side (so its cookie stops
+/// working even if it was copied elsewhere) and tell the browser to drop it.
+async fn logout_handler(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Some(raw) = auth::session_cookie_from_headers(&headers) {
+        if let Some((sid, _)) = auth::parse_session_cookie(&state.session_key, &raw) {
+            if let Ok(mut store) = state.sessions.write() {
+                store.revoke(&sid);
+            }
+        }
+    }
     json_ok_with_cookie(session_set_cookie("", request_is_https(&headers), 0))
 }
 
@@ -515,7 +557,7 @@ async fn start_commit_job_handler(
     Json(request): Json<StartCommitJobRequest>,
 ) -> Response {
     if state.token_required
-        && !request_is_authorized(params.token.as_deref(), &headers, &state.token, &state.session_key)
+        && !request_is_authorized(params.token.as_deref(), &headers, &state)
     {
         return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
     }
@@ -546,7 +588,7 @@ async fn version_handler(
     State(state): State<AppState>,
 ) -> Response {
     if state.token_required
-        && !request_is_authorized(params.token.as_deref(), &headers, &state.token, &state.session_key)
+        && !request_is_authorized(params.token.as_deref(), &headers, &state)
     {
         return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
     }
@@ -628,7 +670,7 @@ async fn init_handler(
 ) -> Response {
     // Validate token (skip if token not required)
     if state.token_required
-        && !request_is_authorized(params.token.as_deref(), &headers, &state.token, &state.session_key)
+        && !request_is_authorized(params.token.as_deref(), &headers, &state)
     {
         return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
     }
@@ -1028,7 +1070,7 @@ async fn file_handler(
 ) -> Response {
     // Validate token
     if state.token_required
-        && !request_is_authorized(params.token.as_deref(), &headers, &state.token, &state.session_key)
+        && !request_is_authorized(params.token.as_deref(), &headers, &state)
     {
         return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
     }
@@ -1083,7 +1125,7 @@ async fn file_handler(
 
 fn validate_token(params: &WsAuth, headers: &HeaderMap, state: &AppState) -> Result<(), Response> {
     if state.token_required
-        && !request_is_authorized(params.token.as_deref(), headers, &state.token, &state.session_key)
+        && !request_is_authorized(params.token.as_deref(), headers, state)
     {
         return Err((StatusCode::UNAUTHORIZED, "Invalid token").into_response());
     }
@@ -1387,15 +1429,29 @@ fn token_from_query_or_bearer(query_token: Option<&str>, headers: &HeaderMap) ->
 fn request_is_authorized(
     query_token: Option<&str>,
     headers: &HeaderMap,
-    expected: &str,
-    session_key: &[u8],
+    state: &AppState,
 ) -> bool {
     // Either a valid raw token (query/bearer, used by native + first login) or a
-    // valid session cookie (browser, after /api/login) authorizes the request.
+    // live session cookie (browser, after /api/login) authorizes the request.
     let token_ok = token_from_query_or_bearer(query_token, headers)
         .as_deref()
-        .is_some_and(|provided| auth::validate_token(provided, expected));
-    token_ok || auth::session_cookie_valid(headers, session_key)
+        .is_some_and(|provided| auth::validate_token(provided, &state.token));
+    token_ok || active_session_sid(headers, state).is_some()
+}
+
+/// Resolve the request's session cookie to a live `sid`: the signature must
+/// verify, the embedded expiry must be in the future, AND the sid must still be
+/// listed in the store (so a revoked device is rejected even though its cookie
+/// is still perfectly signed).
+fn active_session_sid(headers: &HeaderMap, state: &AppState) -> Option<String> {
+    let raw = auth::session_cookie_from_headers(headers)?;
+    let (sid, expires_at) = auth::parse_session_cookie(&state.session_key, &raw)?;
+    let now = now_unix_secs();
+    if expires_at <= now {
+        return None;
+    }
+    let store = state.sessions.read().ok()?;
+    store.is_active(&sid, now).then_some(sid)
 }
 
 pub fn list_bind_host_options() -> Vec<BindHostOption> {
