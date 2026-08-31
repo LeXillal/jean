@@ -519,9 +519,14 @@ class WsTransport {
     this.notifySubscribers()
   }
 
+  // Overloads force every caller that sets a message to also classify it —
+  // otherwise the UI cannot tell a first visit from a refused token or a
+  // dead server, and silently picks the wrong screen.
+  private setAuthError(error: null): void
+  private setAuthError(error: string, reason: WsAuthReason): void
   private setAuthError(error: string | null, reason?: WsAuthReason): void {
     this._authError = error
-    this._authReason = error === null ? null : (reason ?? 'unreachable')
+    this._authReason = error === null ? null : (reason as WsAuthReason)
     this.notifySubscribers()
   }
 

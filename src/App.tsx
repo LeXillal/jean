@@ -138,7 +138,10 @@ function WsAuthErrorOverlay() {
     <div className="fixed inset-0 z-[80] flex items-center justify-center bg-background">
       <WebAccessAuthScreen
         authError={authError}
-        reason={authReason ?? 'signed-out'}
+        // 'unreachable' only arises on remote paths; if one slips through
+        // (remote removed right after a drop), the sign-in form still works —
+        // submitting reloads the page, which is how connections recover.
+        reason={authReason === 'rejected' ? 'rejected' : 'signed-out'}
         onTokenSubmit={handleWsAuthTokenSubmit}
       />
     </div>

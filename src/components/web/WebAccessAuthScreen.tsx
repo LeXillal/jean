@@ -6,8 +6,10 @@ import type { WsAuthReason } from '@/lib/transport'
 
 interface WebAccessAuthScreenProps {
   authError: string
-  /** Why we are asking. Defaults to a first visit rather than a failure. */
-  reason?: WsAuthReason
+  /** Why we are asking. Defaults to a first visit rather than a failure.
+   * Whatever the reason, the form stays available: submitting a token
+   * reloads the page, which is also how a lost connection recovers. */
+  reason?: Exclude<WsAuthReason, 'unreachable'>
   onTokenSubmit: (token: string) => void | Promise<void>
 }
 
@@ -28,9 +30,6 @@ export function WebAccessAuthScreen({
   const [submitting, setSubmitting] = useState(false)
 
   const host = serverLabel()
-  // An unreachable server is not something a token can fix — don't invite the
-  // user to paste one into the void.
-  const canSubmit = reason !== 'unreachable'
 
   const handleSubmit = async (event: FormEvent) => {
     event.preventDefault()
@@ -59,7 +58,7 @@ export function WebAccessAuthScreen({
           className="size-12 rounded-xl"
         />
         <h1 className="mt-5 text-xl font-semibold tracking-tight">
-          {canSubmit ? 'Sign in to Jean' : 'Server unavailable'}
+          Sign in to Jean
         </h1>
         {host && (
           <p className="mt-1.5 font-mono text-xs text-muted-foreground">
@@ -68,56 +67,49 @@ export function WebAccessAuthScreen({
         )}
       </div>
 
-      {canSubmit ? (
-        <form className="mt-8 space-y-4" onSubmit={handleSubmit}>
-          <div className="space-y-2">
-            <Label htmlFor="web-access-token">Access token</Label>
-            <Input
-              id="web-access-token"
-              type="password"
-              autoComplete="current-password"
-              autoFocus
-              value={token}
-              onChange={event => {
-                setToken(event.target.value)
-                if (emptyError) setEmptyError(false)
-              }}
-              placeholder="Paste your Jean access token"
-              aria-describedby={
-                reason === 'rejected' ? 'web-access-token-error' : undefined
-              }
-              aria-invalid={reason === 'rejected' || emptyError}
-            />
-            {emptyError && (
-              <p className="text-xs text-destructive">
-                Enter the access token from Jean&apos;s Web Access settings.
-              </p>
-            )}
-            {reason === 'rejected' && !emptyError && (
-              <p
-                id="web-access-token-error"
-                role="alert"
-                className="text-xs text-destructive"
-              >
-                {authError}
-              </p>
-            )}
-          </div>
+      <form className="mt-8 space-y-4" onSubmit={handleSubmit}>
+        <div className="space-y-2">
+          <Label htmlFor="web-access-token">Access token</Label>
+          <Input
+            id="web-access-token"
+            type="password"
+            autoComplete="current-password"
+            autoFocus
+            value={token}
+            onChange={event => {
+              setToken(event.target.value)
+              if (emptyError) setEmptyError(false)
+            }}
+            placeholder="Paste your Jean access token"
+            aria-describedby={
+              reason === 'rejected' ? 'web-access-token-error' : undefined
+            }
+            aria-invalid={reason === 'rejected' || emptyError}
+          />
+          {emptyError && (
+            <p className="text-xs text-destructive">
+              Enter the access token from Jean&apos;s Web Access settings.
+            </p>
+          )}
+          {reason === 'rejected' && !emptyError && (
+            <p
+              id="web-access-token-error"
+              role="alert"
+              className="text-xs text-destructive"
+            >
+              {authError}
+            </p>
+          )}
+        </div>
 
-          <Button type="submit" className="w-full" disabled={submitting}>
-            {submitting ? 'Signing in…' : 'Sign in'}
-          </Button>
-        </form>
-      ) : (
-        <p role="alert" className="mt-8 text-sm text-muted-foreground">
-          {authError}
-        </p>
-      )}
+        <Button type="submit" className="w-full" disabled={submitting}>
+          {submitting ? 'Signing in…' : 'Sign in'}
+        </Button>
+      </form>
 
       <p className="mt-8 text-center text-xs text-muted-foreground">
-        {canSubmit
-          ? 'Find the token in Web Access settings, or in /etc/jean-server.env on the server.'
-          : 'Jean will reconnect on its own once the server answers again.'}
+        Find the token in Web Access settings, or in /etc/jean-server.env on the
+        server.
       </p>
     </div>
   )

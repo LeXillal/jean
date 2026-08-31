@@ -72,17 +72,15 @@ describe('WebAccessAuthScreen', () => {
     )
   })
 
-  it('hides the form when the server cannot be reached', () => {
+  it('always offers the token form — submitting reloads, which is how a lost connection recovers', () => {
     render(
       <WebAccessAuthScreen
-        authError="Jean could not reach the server."
-        reason="unreachable"
+        authError="Connection to the server was lost."
         onTokenSubmit={vi.fn()}
       />
     )
 
-    // Pasting a token cannot fix an unreachable server, so don't ask for one.
-    expect(screen.queryByLabelText(/access token/i)).not.toBeInTheDocument()
-    expect(screen.getByRole('alert')).toHaveTextContent(/could not reach/i)
+    expect(screen.getByLabelText(/access token/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /sign in/i })).toBeEnabled()
   })
 })
