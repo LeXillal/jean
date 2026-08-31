@@ -19,6 +19,10 @@ describe('WebAccessAuthScreen', () => {
     fireEvent.click(screen.getByRole('button', { name: /sign in/i }))
 
     expect(onTokenSubmit).toHaveBeenCalledWith('secret-token')
+
+    // Submitting reloads the page; the button stays locked until then so the
+    // user gets feedback and cannot double-submit.
+    expect(screen.getByRole('button', { name: /signing in/i })).toBeDisabled()
   })
 
   it('does not submit blank tokens', async () => {

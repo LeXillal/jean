@@ -10,7 +10,7 @@ interface WebAccessAuthScreenProps {
    * Whatever the reason, the form stays available: submitting a token
    * reloads the page, which is also how a lost connection recovers. */
   reason?: Exclude<WsAuthReason, 'unreachable'>
-  onTokenSubmit: (token: string) => void | Promise<void>
+  onTokenSubmit: (token: string) => void
 }
 
 /** Host the token unlocks, so people running several Jean servers can tell
@@ -31,7 +31,7 @@ export function WebAccessAuthScreen({
 
   const host = serverLabel()
 
-  const handleSubmit = async (event: FormEvent) => {
+  const handleSubmit = (event: FormEvent) => {
     event.preventDefault()
     const trimmed = token.trim()
     if (!trimmed) {
@@ -39,12 +39,10 @@ export function WebAccessAuthScreen({
       return
     }
     setEmptyError(false)
+    // Submitting reloads the page (validation happens on the fresh load), so
+    // never re-enable the button — the reload resets it.
     setSubmitting(true)
-    try {
-      await onTokenSubmit(trimmed)
-    } finally {
-      setSubmitting(false)
-    }
+    onTokenSubmit(trimmed)
   }
 
   return (
