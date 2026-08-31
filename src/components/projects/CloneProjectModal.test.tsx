@@ -99,7 +99,7 @@ describe('CloneProjectModal', () => {
   })
 
   it('opens the remote directory browser when connected to a remote backend', async () => {
-    const remote = addRemoteConnection({
+    const remote = await addRemoteConnection({
       name: 'Remote host',
       url: 'https://remote.example.com',
       token: 'test-token',

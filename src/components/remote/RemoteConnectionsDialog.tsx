@@ -324,7 +324,7 @@ export function RemoteConnectionsDialog({
             return
           }
         }
-        const connection = addRemoteConnection(input)
+        const connection = await addRemoteConnection(input)
         markConnectionSwitch()
         selectConnection(connection.id)
         reloadApp()
@@ -341,12 +341,12 @@ export function RemoteConnectionsDialog({
           } catch {
             // Allow reconnect; recovery screen handles hard failures.
           }
-          updateRemoteConnection(editingId, input)
+          await updateRemoteConnection(editingId, input)
           markConnectionSwitch()
           reloadApp()
           return
         }
-        const updated = updateRemoteConnection(editingId, input)
+        const updated = await updateRemoteConnection(editingId, input)
         // Probe after save so the list shows the new version promptly.
         void refreshVersions(
           connections.map(item => (item.id === editingId ? updated : item))
@@ -411,7 +411,7 @@ export function RemoteConnectionsDialog({
         throw new Error('Remote jean-server did not report ready.')
       }
 
-      const connection = addRemoteConnection({
+      const connection = await addRemoteConnection({
         name: result.name,
         url: result.url,
         token: result.token,
@@ -433,9 +433,16 @@ export function RemoteConnectionsDialog({
     }
   }
 
-  const handleDelete = (id: string) => {
+  const handleDelete = async (id: string) => {
     const wasActive = id === activeId
-    removeRemoteConnection(id)
+    try {
+      await removeRemoteConnection(id)
+    } catch (deleteError) {
+      setError(
+        deleteError instanceof Error ? deleteError.message : String(deleteError)
+      )
+      return
+    }
     if (wasActive) {
       markConnectionSwitch()
       reloadApp()

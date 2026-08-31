@@ -263,6 +263,10 @@ pub async fn start_server(
         .route("/api/logout", post(logout_handler))
         .route("/api/commit-jobs", post(start_commit_job_handler))
         .route("/api/init", get(init_handler))
+        .route(
+            "/api/remote-connections",
+            get(get_remote_connections_handler).put(put_remote_connections_handler),
+        )
         .route("/api/version", get(version_handler))
         .route("/api/files/{*filepath}", get(file_handler))
         .route("/api/project-files/{*filepath}", get(project_file_handler))
@@ -636,6 +640,122 @@ async fn start_commit_job_handler(
     {
         Ok(result) => (StatusCode::ACCEPTED, Json(result)).into_response(),
         Err(error) => (StatusCode::CONFLICT, error).into_response(),
+    }
+}
+
+/// A remote Jean server saved by web clients. The list is stored on this
+/// server (not in browser localStorage) so every device pointed at it shares
+/// one configuration and tokens are never persisted in the browser.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+struct RemoteConnectionEntry {
+    id: String,
+    name: String,
+    url: String,
+    token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ssh_user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ssh_host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ssh_port: Option<u16>,
+}
+
+const REMOTE_CONNECTIONS_FILE: &str = "remote-connections.json";
+const REMOTE_CONNECTIONS_MAX: usize = 100;
+
+fn remote_connections_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Cannot resolve app data dir: {e}"))?;
+    Ok(app_data_dir.join(REMOTE_CONNECTIONS_FILE))
+}
+
+/// Missing or corrupt files yield an empty list — the browser falls back to
+/// an empty picker rather than failing to boot.
+fn load_remote_connections(path: &std::path::Path) -> Vec<RemoteConnectionEntry> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+/// Atomic write (temp file + rename). The file holds access tokens for other
+/// Jean servers, so restrict it to the owner on Unix.
+fn save_remote_connections(
+    path: &std::path::Path,
+    entries: &[RemoteConnectionEntry],
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create app data dir: {e}"))?;
+    }
+
+    let json = serde_json::to_string_pretty(entries)
+        .map_err(|e| format!("Cannot serialize remote connections: {e}"))?;
+    let temp_path = path.with_extension("tmp");
+    std::fs::write(&temp_path, json)
+        .map_err(|e| format!("Cannot write remote connections: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    std::fs::rename(&temp_path, path).map_err(|e| format!("Cannot persist remote connections: {e}"))
+}
+
+async fn get_remote_connections_handler(
+    headers: HeaderMap,
+    Query(params): Query<WsAuth>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = validate_token(&params, &headers, &state) {
+        return response;
+    }
+
+    let path = match remote_connections_path(&state.app) {
+        Ok(path) => path,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    Json(load_remote_connections(&path)).into_response()
+}
+
+async fn put_remote_connections_handler(
+    headers: HeaderMap,
+    Query(params): Query<WsAuth>,
+    State(state): State<AppState>,
+    Json(entries): Json<Vec<RemoteConnectionEntry>>,
+) -> Response {
+    if let Err(response) = validate_token(&params, &headers, &state) {
+        return response;
+    }
+
+    if entries.len() > REMOTE_CONNECTIONS_MAX {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "Too many remote connections").into_response();
+    }
+    if entries
+        .iter()
+        .any(|entry| entry.id.trim().is_empty() || entry.url.trim().is_empty())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Remote connections need an id and a URL",
+        )
+            .into_response();
+    }
+
+    let path = match remote_connections_path(&state.app) {
+        Ok(path) => path,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    match save_remote_connections(&path, &entries) {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => {
+            log::error!("Failed to save remote connections: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
+        }
     }
 }
 
@@ -1630,8 +1750,9 @@ mod tests {
     use super::{
         bind_host_option_label, bind_host_option_rank, display_host_for_bind_ip,
         display_ip_for_bind_ip_with_candidates, embedded_asset_path_for_request, format_http_url,
-        is_tailscale_ipv4, parse_bind_ip, path_is_in_known_roots, token_from_query_or_bearer,
-        validate_bind_host,
+        is_tailscale_ipv4, load_remote_connections, parse_bind_ip, path_is_in_known_roots,
+        save_remote_connections, token_from_query_or_bearer, validate_bind_host,
+        RemoteConnectionEntry,
     };
     use axum::http::{HeaderMap, HeaderValue};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -1932,5 +2053,56 @@ mod tests {
             &canonical_sibling,
             &[canonical_root]
         ));
+    }
+
+    #[test]
+    fn remote_connections_round_trip_preserves_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remote-connections.json");
+
+        let entries = vec![
+            RemoteConnectionEntry {
+                id: "a".into(),
+                name: "ses-temps".into(),
+                url: "https://huguette.example:8443".into(),
+                token: "tok-a".into(),
+                ssh_user: Some("root".into()),
+                ssh_host: Some("192.168.1.61".into()),
+                ssh_port: Some(2222),
+            },
+            RemoteConnectionEntry {
+                id: "b".into(),
+                name: "jean".into(),
+                url: "http://192.168.1.78:3456".into(),
+                token: "tok-b".into(),
+                ssh_user: None,
+                ssh_host: None,
+                ssh_port: None,
+            },
+        ];
+
+        save_remote_connections(&path, &entries).unwrap();
+        assert_eq!(load_remote_connections(&path), entries);
+
+        // Optional SSH fields are omitted from the stored JSON entirely.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("\"sshUser\": null"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn remote_connections_missing_or_corrupt_file_loads_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("remote-connections.json");
+        assert!(load_remote_connections(&missing).is_empty());
+
+        std::fs::write(&missing, "{not json").unwrap();
+        assert!(load_remote_connections(&missing).is_empty());
     }
 }

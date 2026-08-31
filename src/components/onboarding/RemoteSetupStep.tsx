@@ -115,7 +115,7 @@ export function RemoteSetupStep({
         }
       }
 
-      const connection = addRemoteConnection(input)
+      const connection = await addRemoteConnection(input)
       markConnectionSwitch()
       selectConnection(connection.id)
       reloadApp()
@@ -177,7 +177,7 @@ export function RemoteSetupStep({
         throw new Error('Remote jean-server did not report ready.')
       }
 
-      const connection = addRemoteConnection({
+      const connection = await addRemoteConnection({
         name: result.name,
         url: result.url,
         token: result.token,

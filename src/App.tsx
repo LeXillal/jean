@@ -103,6 +103,7 @@ import { peekWebReloadState, saveWebReloadState } from './lib/web-reload-state'
 import {
   clearConnectionSwitch,
   getActiveRemoteConnection,
+  initRemoteConnections,
   isConnectionSwitchPending,
 } from './lib/remote-connections'
 import { RemoteConnectionRecovery } from './components/remote/RemoteConnectionRecovery'
@@ -764,31 +765,35 @@ function App() {
   useEffect(() => {
     if (!webBackend) return
 
-    if (!hasStartedTransportRef.current) {
-      hasStartedTransportRef.current = true
-      connectTransport()
-    }
+    // The active remote's URL and token live on the origin server in web
+    // mode; resolve the connection list before opening any transport.
+    void initRemoteConnections().then(() => {
+      if (!hasStartedTransportRef.current) {
+        hasStartedTransportRef.current = true
+        connectTransport()
+      }
 
-    const initialSelectedProjectId =
-      peekWebReloadState()?.projectId ??
-      useProjectsStore.getState().selectedProjectId
-    preloadInitialData(initialSelectedProjectId)
-      .then(data => {
-        if (data) {
-          logger.info('Preloaded initial data via HTTP', {
-            projects: Array.isArray(data.projects) ? data.projects.length : 0,
-          })
-          checkWebClientVersion(data)
-          seedCache(data)
-          ingestBootstrapEvents(data.replayEvents ?? [])
-        }
-      })
-      .catch(err => {
-        logger.warn('Failed to preload initial data', { error: err })
-      })
-      .finally(() => {
-        setIsPreloading(false)
-      })
+      const initialSelectedProjectId =
+        peekWebReloadState()?.projectId ??
+        useProjectsStore.getState().selectedProjectId
+      preloadInitialData(initialSelectedProjectId)
+        .then(data => {
+          if (data) {
+            logger.info('Preloaded initial data via HTTP', {
+              projects: Array.isArray(data.projects) ? data.projects.length : 0,
+            })
+            checkWebClientVersion(data)
+            seedCache(data)
+            ingestBootstrapEvents(data.replayEvents ?? [])
+          }
+        })
+        .catch(err => {
+          logger.warn('Failed to preload initial data', { error: err })
+        })
+        .finally(() => {
+          setIsPreloading(false)
+        })
+    })
   }, [queryClient, seedCache, webBackend])
 
   // Global safety net for uncaught async errors / promise rejections.

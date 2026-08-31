@@ -1,4 +1,7 @@
 import { useSyncExternalStore } from 'react'
+// Circular import with environment.ts (it re-exports nothing from here at
+// module scope); isNativeApp is only called after both modules evaluate.
+import { isNativeApp } from './environment'
 import { generateId } from './uuid'
 
 export const LOCAL_CONNECTION_ID = 'local'
@@ -42,15 +45,15 @@ export function parseOptionalSshPort(raw: string): number | undefined {
 
 const subscribers = new Set<() => void>()
 let connectionsSnapshot: RemoteConnection[] = readConnections()
-const savedActiveConnection =
-  storage()?.getItem(ACTIVE_CONNECTION_KEY) || LOCAL_CONNECTION_ID
+// Raw saved selection. Validation against the list is deferred to
+// getActiveConnectionId() because in web mode the list arrives
+// asynchronously from the server (initRemoteConnections).
 let activeConnectionSnapshot =
-  savedActiveConnection === LOCAL_CONNECTION_ID ||
-  connectionsSnapshot.some(
-    connection => connection.id === savedActiveConnection
-  )
-    ? savedActiveConnection
-    : LOCAL_CONNECTION_ID
+  storage()?.getItem(ACTIVE_CONNECTION_KEY) || LOCAL_CONNECTION_ID
+
+function notifySubscribers(): void {
+  for (const subscriber of subscribers) subscriber()
+}
 
 function storage(): Storage | null {
   return typeof window === 'undefined' ? null : window.localStorage
@@ -132,10 +135,86 @@ function sshFieldsFromInput(input: RemoteConnectionInput): {
   return fields
 }
 
-function writeConnections(connections: RemoteConnection[]): void {
+/** Web clients store the list on the origin Jean server so every device
+ * shares one configuration and remote tokens never persist in the browser.
+ * Native apps keep localStorage (their WebView storage is machine-local). */
+function usesServerConnectionStore(): boolean {
+  if (typeof window === 'undefined' || isNativeApp()) return false
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return !(window as any).__JEAN_E2E_MOCK__
+}
+
+function serverConnectionsUrl(): string {
+  const urlToken = new URLSearchParams(window.location.search).get('token')
+  const token = urlToken || storage()?.getItem('jean-http-token') || ''
+  const params = token ? `?token=${encodeURIComponent(token)}` : ''
+  return `${window.location.origin}/api/remote-connections${params}`
+}
+
+async function pushServerConnections(
+  connections: RemoteConnection[]
+): Promise<void> {
+  const response = await fetch(serverConnectionsUrl(), {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(connections),
+  })
+  if (!response.ok) {
+    throw new Error('Failed to save connections to the Jean server.')
+  }
+}
+
+function commitConnections(connections: RemoteConnection[]): void {
   connectionsSnapshot = connections
+  notifySubscribers()
+}
+
+async function persistConnections(
+  connections: RemoteConnection[]
+): Promise<void> {
+  if (usesServerConnectionStore()) {
+    // Server write must complete before commit: callers reload the page
+    // right after, which would abort an in-flight PUT.
+    await pushServerConnections(connections)
+    commitConnections(connections)
+    return
+  }
   storage()?.setItem(CONNECTIONS_KEY, JSON.stringify(connections))
-  for (const subscriber of subscribers) subscriber()
+  commitConnections(connections)
+}
+
+let initPromise: Promise<void> | null = null
+
+/**
+ * Load the connection list from the origin Jean server (web mode only).
+ * Must resolve before the transport connects: the active remote's URL and
+ * token come from this list. A pre-server-store localStorage list is
+ * migrated up once, then removed from the browser.
+ */
+export function initRemoteConnections(): Promise<void> {
+  if (!usesServerConnectionStore()) return Promise.resolve()
+  initPromise ??= (async () => {
+    try {
+      const response = await fetch(serverConnectionsUrl())
+      // Unauthenticated or older server: keep the localStorage fallback.
+      if (!response.ok) return
+      const parsed: unknown = await response.json()
+      const serverList = (Array.isArray(parsed) ? parsed : [])
+        .map(normalizeConnection)
+        .filter((item): item is RemoteConnection => item !== null)
+
+      const legacy = readConnections().filter(
+        item => !serverList.some(existing => existing.id === item.id)
+      )
+      const merged = [...serverList, ...legacy]
+      if (legacy.length > 0) await pushServerConnections(merged)
+      storage()?.removeItem(CONNECTIONS_KEY)
+      commitConnections(merged)
+    } catch {
+      // Server unreachable: keep whatever localStorage had.
+    }
+  })()
+  return initPromise
 }
 
 export function parseRemoteConnectionInput(
@@ -166,9 +245,9 @@ export function getRemoteConnections(): RemoteConnection[] {
   return connectionsSnapshot
 }
 
-export function addRemoteConnection(
+export async function addRemoteConnection(
   input: RemoteConnectionInput
-): RemoteConnection {
+): Promise<RemoteConnection> {
   const normalized = parseRemoteConnectionInput(input.url, input.token)
   const connection: RemoteConnection = {
     id: generateId(),
@@ -176,14 +255,14 @@ export function addRemoteConnection(
     ...normalized,
     ...sshFieldsFromInput(input),
   }
-  writeConnections([...getRemoteConnections(), connection])
+  await persistConnections([...getRemoteConnections(), connection])
   return connection
 }
 
-export function updateRemoteConnection(
+export async function updateRemoteConnection(
   id: string,
   input: RemoteConnectionInput
-): RemoteConnection {
+): Promise<RemoteConnection> {
   const normalized = parseRemoteConnectionInput(input.url, input.token)
   const updated: RemoteConnection = {
     id,
@@ -195,21 +274,30 @@ export function updateRemoteConnection(
   if (!connections.some(connection => connection.id === id)) {
     throw new Error('Remote connection not found.')
   }
-  writeConnections(
+  await persistConnections(
     connections.map(connection => (connection.id === id ? updated : connection))
   )
   return updated
 }
 
-export function removeRemoteConnection(id: string): void {
-  writeConnections(
+export async function removeRemoteConnection(id: string): Promise<void> {
+  await persistConnections(
     getRemoteConnections().filter(connection => connection.id !== id)
   )
-  if (getActiveConnectionId() === id) selectConnection(LOCAL_CONNECTION_ID)
+  // Compare the raw saved id: the lazy getter already resolves a removed
+  // connection to 'local', which would skip clearing the stored selection.
+  if (activeConnectionSnapshot === id) selectConnection(LOCAL_CONNECTION_ID)
 }
 
 export function getActiveConnectionId(): string {
-  return activeConnectionSnapshot
+  if (activeConnectionSnapshot === LOCAL_CONNECTION_ID) {
+    return LOCAL_CONNECTION_ID
+  }
+  return connectionsSnapshot.some(
+    connection => connection.id === activeConnectionSnapshot
+  )
+    ? activeConnectionSnapshot
+    : LOCAL_CONNECTION_ID
 }
 
 export function getActiveRemoteConnection(): RemoteConnection | null {
@@ -229,7 +317,7 @@ export function selectConnection(id: string): void {
       : LOCAL_CONNECTION_ID
   activeConnectionSnapshot = selected
   storage()?.setItem(ACTIVE_CONNECTION_KEY, selected)
-  for (const subscriber of subscribers) subscriber()
+  notifySubscribers()
 }
 
 export function markConnectionSwitch(): void {
