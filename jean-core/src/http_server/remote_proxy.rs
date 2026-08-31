@@ -1,0 +1,474 @@
+//! Remote-connection proxy.
+//!
+//! In web-access mode a browser used to connect directly to a remote Jean
+//! server with that remote's URL *and* token. This module turns the hub (the
+//! server the browser is talking to) into a reverse proxy: the browser calls
+//! `<hub>/remote/<id>/api/...` (HTTP) and `<hub>/remote/<id>/ws` (WebSocket)
+//! authenticated with only the *hub* token, and the hub forwards each request
+//! to the selected remote, injecting the remote's own token. Remote tokens are
+//! never exposed to the browser.
+//!
+//! Security notes:
+//! - The hub token is required (when `token_required`) and is stripped from the
+//!   query before forwarding, so it never leaks upstream.
+//! - The remote token is injected server-side only.
+//! - An anti-loop guard refuses to target the hub itself.
+//! - No URL containing a query string (`?token=`) is ever logged.
+
+use axum::{
+    body::{Body, Bytes},
+    extract::{
+        ws::{CloseFrame as AxumCloseFrame, Message as AxumMessage, WebSocket, WebSocketUpgrade},
+        OriginalUri, Path as AxumPath, Query, State,
+    },
+    http::{HeaderMap, HeaderValue, Method, StatusCode},
+    response::{IntoResponse, Response},
+};
+use futures_util::{SinkExt, StreamExt};
+use std::time::Duration;
+use tokio_tungstenite::tungstenite::{
+    protocol::frame::coding::CloseCode as TsCloseCode, protocol::CloseFrame as TsCloseFrame,
+    Message as TsMessage, Utf8Bytes as TsUtf8Bytes,
+};
+
+use super::server::{
+    load_remote_connections, remote_connections_path, request_is_authorized, AppState,
+    RemoteConnectionEntry, WsAuth,
+};
+
+/// Upstream request timeout. Kept short so a dead remote fails the browser
+/// request quickly instead of hanging the connection.
+const UPSTREAM_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
+// ── Pure helpers (unit-tested) ───────────────────────────────────────────────
+
+/// Find a remote connection by id.
+pub(super) fn resolve_remote<'a>(
+    entries: &'a [RemoteConnectionEntry],
+    id: &str,
+) -> Option<&'a RemoteConnectionEntry> {
+    entries.iter().find(|entry| entry.id == id)
+}
+
+/// Extract the `token` value from a raw query string, if present.
+fn token_from_raw_query(query: Option<&str>) -> Option<String> {
+    let query = query?;
+    let probe = reqwest::Url::parse(&format!("http://x/?{query}")).ok()?;
+    probe
+        .query_pairs()
+        .find(|(key, _)| key == "token")
+        .map(|(_, value)| value.into_owned())
+}
+
+/// Build the upstream HTTP URL: `{remote_url}/api/{sub_path}` with the incoming
+/// query merged in, minus any client-provided `token`, plus the remote's token.
+pub(super) fn build_upstream_http_url(
+    remote_url: &str,
+    sub_path: &str,
+    incoming_query: Option<&str>,
+    token: &str,
+) -> Result<String, String> {
+    let base = remote_url.trim_end_matches('/');
+    let mut url = reqwest::Url::parse(&format!("{base}/api/{sub_path}"))
+        .map_err(|e| format!("invalid upstream url: {e}"))?;
+
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    if let Some(query) = incoming_query.filter(|q| !q.is_empty()) {
+        let probe = reqwest::Url::parse(&format!("http://x/?{query}"))
+            .map_err(|e| format!("invalid query: {e}"))?;
+        for (key, value) in probe.query_pairs() {
+            if key == "token" {
+                continue; // never forward the hub token upstream
+            }
+            pairs.push((key.into_owned(), value.into_owned()));
+        }
+    }
+    pairs.push(("token".to_string(), token.to_string()));
+    url.query_pairs_mut().clear().extend_pairs(&pairs);
+
+    Ok(url.to_string())
+}
+
+/// Build the upstream WebSocket URL: `{remote_url}/ws?token=...` with the
+/// scheme swapped http→ws / https→wss.
+pub(super) fn build_upstream_ws_url(remote_url: &str, token: &str) -> Result<String, String> {
+    let base = remote_url.trim_end_matches('/');
+    let ws_base = if let Some(rest) = base.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = base.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else if base.starts_with("wss://") || base.starts_with("ws://") {
+        base.to_string()
+    } else {
+        return Err("remote url must start with http(s):// or ws(s)://".to_string());
+    };
+
+    let mut url = reqwest::Url::parse(&format!("{ws_base}/ws"))
+        .map_err(|e| format!("invalid upstream ws url: {e}"))?;
+    url.query_pairs_mut().clear().append_pair("token", token);
+    Ok(url.to_string())
+}
+
+/// Hop-by-hop headers that must not be forwarded (RFC 7230 §6.1) plus `host`,
+/// which reqwest sets from the target URL.
+pub(super) fn is_hop_by_hop(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "host"
+    )
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0" | "::" | "[::]"
+    )
+}
+
+/// Anti-loop guard: true when `remote_url` points back at the hub itself.
+/// Conservative — only reports self when the port matches and the host is
+/// either an exact match or both sides are loopback aliases.
+pub(super) fn remote_targets_self(remote_url: &str, own_host: &str, own_port: u16) -> bool {
+    let Ok(url) = reqwest::Url::parse(remote_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let Some(port) = url.port_or_known_default() else {
+        return false;
+    };
+    if port != own_port {
+        return false;
+    }
+    if host.eq_ignore_ascii_case(own_host) {
+        return true;
+    }
+    is_loopback_host(host) && is_loopback_host(own_host)
+}
+
+// ── HTTP proxy handler ───────────────────────────────────────────────────────
+
+pub(super) async fn remote_http_proxy_handler(
+    AxumPath((id, sub_path)): AxumPath<(String, String)>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Response {
+    // (a) Hub token auth.
+    if state.token_required {
+        let query_token = token_from_raw_query(uri.query());
+        if !request_is_authorized(query_token.as_deref(), &headers, &state.token) {
+            return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
+        }
+    }
+
+    // (b) Resolve the remote.
+    let path = match remote_connections_path(&state.app) {
+        Ok(path) => path,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let entries = load_remote_connections(&path);
+    let Some(entry) = resolve_remote(&entries, &id) else {
+        return (StatusCode::NOT_FOUND, "Unknown remote").into_response();
+    };
+
+    // (c) Anti-loop.
+    if remote_targets_self(&entry.url, &state.own_host, state.own_port) {
+        return (StatusCode::BAD_REQUEST, "Remote targets this hub").into_response();
+    }
+
+    // (d) Build the upstream URL (injects the remote token).
+    let upstream_url =
+        match build_upstream_http_url(&entry.url, &sub_path, uri.query(), &entry.token) {
+            Ok(url) => url,
+            Err(_) => return (StatusCode::BAD_GATEWAY, "invalid remote url").into_response(),
+        };
+
+    // (e) Forward. Drop hop-by-hop + host, force identity encoding so the hub's
+    // own CompressionLayer is the only thing that (re)compresses.
+    let mut forward_headers = HeaderMap::new();
+    for (name, value) in headers.iter() {
+        if is_hop_by_hop(name.as_str()) {
+            continue;
+        }
+        forward_headers.insert(name.clone(), value.clone());
+    }
+    forward_headers.insert(
+        reqwest::header::ACCEPT_ENCODING,
+        HeaderValue::from_static("identity"),
+    );
+
+    let upstream = state
+        .http_client
+        .request(method, upstream_url.as_str())
+        .headers(forward_headers)
+        .body(body)
+        .timeout(UPSTREAM_HTTP_TIMEOUT)
+        .send()
+        .await;
+
+    let upstream = match upstream {
+        Ok(response) => response,
+        Err(_) => return (StatusCode::BAD_GATEWAY, "remote unreachable").into_response(),
+    };
+
+    // (f) Re-emit: upstream status + filtered headers, streamed body.
+    let mut builder = Response::builder().status(upstream.status());
+    for (name, value) in upstream.headers().iter() {
+        let lower = name.as_str().to_ascii_lowercase();
+        if is_hop_by_hop(&lower) || lower == "content-length" || lower == "content-encoding" {
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+
+    match builder.body(Body::from_stream(upstream.bytes_stream())) {
+        Ok(response) => response,
+        Err(_) => (StatusCode::BAD_GATEWAY, "proxy response error").into_response(),
+    }
+}
+
+// ── WebSocket proxy handler ──────────────────────────────────────────────────
+
+pub(super) async fn remote_ws_proxy_handler(
+    ws: WebSocketUpgrade,
+    AxumPath(id): AxumPath<String>,
+    Query(auth): Query<WsAuth>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    // Hub token auth, before the upgrade.
+    if state.token_required
+        && !request_is_authorized(auth.token.as_deref(), &headers, &state.token)
+    {
+        return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
+    }
+
+    let path = match remote_connections_path(&state.app) {
+        Ok(path) => path,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let entries = load_remote_connections(&path);
+    let Some(entry) = resolve_remote(&entries, &id) else {
+        return (StatusCode::NOT_FOUND, "Unknown remote").into_response();
+    };
+
+    if remote_targets_self(&entry.url, &state.own_host, state.own_port) {
+        return (StatusCode::BAD_REQUEST, "Remote targets this hub").into_response();
+    }
+
+    let upstream_url = match build_upstream_ws_url(&entry.url, &entry.token) {
+        Ok(url) => url,
+        Err(_) => return (StatusCode::BAD_GATEWAY, "invalid remote url").into_response(),
+    };
+
+    ws.on_upgrade(move |client_ws| proxy_ws(client_ws, upstream_url))
+}
+
+/// Pipe frames verbatim between the browser client and the upstream remote.
+async fn proxy_ws(client_ws: WebSocket, upstream_url: String) {
+    let upstream = match tokio_tungstenite::connect_async(&upstream_url).await {
+        Ok((stream, _response)) => stream,
+        Err(_) => {
+            // Upstream unreachable: close the client cleanly; the browser retries.
+            let mut client_ws = client_ws;
+            let _ = client_ws.send(AxumMessage::Close(None)).await;
+            return;
+        }
+    };
+
+    let (mut client_tx, mut client_rx) = client_ws.split();
+    let (mut upstream_tx, mut upstream_rx) = upstream.split();
+
+    // Client → upstream.
+    let mut client_to_upstream = tokio::spawn(async move {
+        while let Some(message) = client_rx.next().await {
+            let Ok(message) = message else { break };
+            if upstream_tx.send(axum_to_tungstenite(message)).await.is_err() {
+                break;
+            }
+        }
+        let _ = upstream_tx.close().await;
+    });
+
+    // Upstream → client.
+    let mut upstream_to_client = tokio::spawn(async move {
+        while let Some(message) = upstream_rx.next().await {
+            let Ok(message) = message else { break };
+            if let Some(message) = tungstenite_to_axum(message) {
+                if client_tx.send(message).await.is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = client_tx.close().await;
+    });
+
+    // First side to finish tears down the other.
+    tokio::select! {
+        _ = &mut client_to_upstream => upstream_to_client.abort(),
+        _ = &mut upstream_to_client => client_to_upstream.abort(),
+    }
+}
+
+/// axum WebSocket message → tungstenite message. Binary/Ping/Pong payloads
+/// share the same `bytes::Bytes` type across both crates, so they move without
+/// copying; Text/Close carry a small re-wrap.
+fn axum_to_tungstenite(message: AxumMessage) -> TsMessage {
+    match message {
+        AxumMessage::Text(text) => TsMessage::Text(TsUtf8Bytes::from(text.as_str())),
+        AxumMessage::Binary(data) => TsMessage::Binary(data),
+        AxumMessage::Ping(data) => TsMessage::Ping(data),
+        AxumMessage::Pong(data) => TsMessage::Pong(data),
+        AxumMessage::Close(frame) => TsMessage::Close(frame.map(|frame| TsCloseFrame {
+            code: TsCloseCode::from(frame.code),
+            reason: TsUtf8Bytes::from(frame.reason.as_str()),
+        })),
+    }
+}
+
+/// tungstenite message → axum WebSocket message. Raw `Frame` variants never
+/// surface from the read stream, so they are dropped.
+fn tungstenite_to_axum(message: TsMessage) -> Option<AxumMessage> {
+    Some(match message {
+        TsMessage::Text(text) => AxumMessage::Text(text.as_str().into()),
+        TsMessage::Binary(data) => AxumMessage::Binary(data),
+        TsMessage::Ping(data) => AxumMessage::Ping(data),
+        TsMessage::Pong(data) => AxumMessage::Pong(data),
+        TsMessage::Close(frame) => AxumMessage::Close(frame.map(|frame| AxumCloseFrame {
+            code: frame.code.into(),
+            reason: frame.reason.as_str().into(),
+        })),
+        TsMessage::Frame(_) => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: &str, url: &str) -> RemoteConnectionEntry {
+        RemoteConnectionEntry {
+            id: id.into(),
+            name: "name".into(),
+            url: url.into(),
+            token: "remote-token".into(),
+            ssh_user: None,
+            ssh_host: None,
+            ssh_port: None,
+        }
+    }
+
+    #[test]
+    fn resolve_remote_finds_and_misses() {
+        let entries = vec![entry("a", "https://a.example"), entry("b", "https://b.example")];
+        assert_eq!(resolve_remote(&entries, "b").unwrap().url, "https://b.example");
+        assert!(resolve_remote(&entries, "missing").is_none());
+    }
+
+    #[test]
+    fn build_http_url_joins_and_injects_token() {
+        let url = build_upstream_http_url(
+            "https://remote.example:8443/",
+            "sessions/abc",
+            None,
+            "secret",
+        )
+        .unwrap();
+        assert_eq!(url, "https://remote.example:8443/api/sessions/abc?token=secret");
+    }
+
+    #[test]
+    fn build_http_url_merges_incoming_query_and_overrides_token() {
+        let url = build_upstream_http_url(
+            "https://remote.example",
+            "files/x.png",
+            Some("token=HUB&foo=bar&baz=1"),
+            "remote-secret",
+        )
+        .unwrap();
+        // Incoming client token is dropped; foo/baz kept; remote token appended.
+        assert!(url.starts_with("https://remote.example/api/files/x.png?"));
+        assert!(url.contains("foo=bar"));
+        assert!(url.contains("baz=1"));
+        assert!(url.contains("token=remote-secret"));
+        assert!(!url.contains("HUB"));
+    }
+
+    #[test]
+    fn build_ws_url_swaps_scheme() {
+        assert_eq!(
+            build_upstream_ws_url("http://remote.example:3456", "tok").unwrap(),
+            "ws://remote.example:3456/ws?token=tok"
+        );
+        assert_eq!(
+            build_upstream_ws_url("https://remote.example:8443/", "tok").unwrap(),
+            "wss://remote.example:8443/ws?token=tok"
+        );
+    }
+
+    #[test]
+    fn build_ws_url_rejects_non_http_scheme() {
+        assert!(build_upstream_ws_url("ftp://x", "tok").is_err());
+    }
+
+    #[test]
+    fn hop_by_hop_detection() {
+        for header in [
+            "Connection",
+            "keep-alive",
+            "Proxy-Authenticate",
+            "proxy-authorization",
+            "TE",
+            "trailer",
+            "Transfer-Encoding",
+            "Upgrade",
+            "Host",
+        ] {
+            assert!(is_hop_by_hop(header), "{header} should be hop-by-hop");
+        }
+        for header in ["content-type", "authorization", "accept", "x-custom"] {
+            assert!(!is_hop_by_hop(header), "{header} should pass through");
+        }
+    }
+
+    #[test]
+    fn remote_targets_self_detects_loop() {
+        // Exact host + port.
+        assert!(remote_targets_self("http://192.168.1.78:3456", "192.168.1.78", 3456));
+        // Loopback aliases on both sides, same port.
+        assert!(remote_targets_self("http://127.0.0.1:3456", "localhost", 3456));
+        assert!(remote_targets_self("http://localhost:3456", "0.0.0.0", 3456));
+    }
+
+    #[test]
+    fn remote_targets_self_allows_distinct_targets() {
+        // Different port.
+        assert!(!remote_targets_self("http://127.0.0.1:9999", "127.0.0.1", 3456));
+        // Different, non-loopback host, same port.
+        assert!(!remote_targets_self("https://huguette.example:3456", "127.0.0.1", 3456));
+        // Unparseable URL is not treated as a loop (conservative).
+        assert!(!remote_targets_self("not a url", "127.0.0.1", 3456));
+    }
+
+    #[test]
+    fn token_from_raw_query_extracts() {
+        assert_eq!(
+            token_from_raw_query(Some("a=1&token=xyz&b=2")).as_deref(),
+            Some("xyz")
+        );
+        assert!(token_from_raw_query(Some("a=1")).is_none());
+        assert!(token_from_raw_query(None).is_none());
+    }
+}

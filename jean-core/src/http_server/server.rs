@@ -3,7 +3,7 @@ use axum::{
     extract::{ws::WebSocketUpgrade, Path as AxumPath, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{any, get, post},
     Json, Router,
 };
 use if_addrs::get_if_addrs;
@@ -25,12 +25,20 @@ use super::WsBroadcaster;
 
 /// Shared state for the Axum server.
 #[derive(Clone)]
-struct AppState {
-    app: AppHandle,
-    token: String,
-    token_required: bool,
-    localhost_only: bool,
-    dist_path: std::path::PathBuf,
+pub(super) struct AppState {
+    pub(super) app: AppHandle,
+    pub(super) token: String,
+    pub(super) token_required: bool,
+    #[allow(dead_code)]
+    pub(super) localhost_only: bool,
+    pub(super) dist_path: std::path::PathBuf,
+    /// Shared HTTP client for the remote proxy. Built once so connection pools
+    /// and TLS setup are reused across proxied requests.
+    pub(super) http_client: reqwest::Client,
+    /// Host/port this hub is bound to, used by the remote proxy to refuse
+    /// targeting the hub itself (anti-loop).
+    pub(super) own_host: String,
+    pub(super) own_port: u16,
 }
 
 /// Server handle for shutdown coordination.
@@ -56,8 +64,8 @@ pub struct ServerStatus {
 }
 
 #[derive(Deserialize)]
-struct WsAuth {
-    token: Option<String>,
+pub(super) struct WsAuth {
+    pub(super) token: Option<String>,
     /// Browser-provided selected project id. Overrides `ui_state.selected_project_id`
     /// when the disk copy is stale. Used to scope the init payload to only the
     /// worktrees/sessions the user is currently viewing.
@@ -210,12 +218,35 @@ pub async fn start_server(
     // Resolve the dist directory at runtime for static file serving
     let dist_path = resolve_dist_path(&app);
 
+    // Bind first so the real (possibly ephemeral) port is known before building
+    // AppState — the remote proxy's anti-loop check compares against it.
+    let addr = SocketAddr::new(bind_ip, port);
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| format!("Failed to bind to {bind_host}:{port}: {e}"))?;
+
+    let local_addr = listener
+        .local_addr()
+        .map_err(|e| format!("Failed to get local address: {e}"))?;
+
+    let url = format_http_url(&display_host_for_bind_ip(bind_ip), local_addr.port());
+
+    // Shared client for the remote proxy. Do not follow redirects — the browser
+    // should observe upstream redirects verbatim.
+    let http_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("Failed to build proxy HTTP client: {e}"))?;
+
     let state = AppState {
         app: app.clone(),
         token: token.clone(),
         token_required,
         localhost_only,
         dist_path: dist_path.clone(),
+        http_client,
+        own_host: bind_host.clone(),
+        own_port: local_addr.port(),
     };
 
     let cors = cors_layer_from_env();
@@ -234,21 +265,18 @@ pub async fn start_server(
         .route("/api/version", get(version_handler))
         .route("/api/files/{*filepath}", get(file_handler))
         .route("/api/project-files/{*filepath}", get(project_file_handler))
+        .route(
+            "/remote/{id}/api/{*path}",
+            any(super::remote_proxy::remote_http_proxy_handler),
+        )
+        .route(
+            "/remote/{id}/ws",
+            any(super::remote_proxy::remote_ws_proxy_handler),
+        )
         .fallback(get(static_handler))
         .layer(CompressionLayer::new().br(true).gzip(true))
         .layer(cors)
         .with_state(state);
-
-    let addr = SocketAddr::new(bind_ip, port);
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| format!("Failed to bind to {bind_host}:{port}: {e}"))?;
-
-    let local_addr = listener
-        .local_addr()
-        .map_err(|e| format!("Failed to get local address: {e}"))?;
-
-    let url = format_http_url(&display_host_for_bind_ip(bind_ip), local_addr.port());
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let bind_host_for_log = bind_host.clone();
@@ -445,25 +473,125 @@ async fn start_commit_job_handler(
 /// A remote Jean server saved by web clients. The list is stored on this
 /// server (not in browser localStorage) so every device pointed at it shares
 /// one configuration and tokens are never persisted in the browser.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
-struct RemoteConnectionEntry {
+pub(super) struct RemoteConnectionEntry {
+    pub(super) id: String,
+    pub(super) name: String,
+    pub(super) url: String,
+    pub(super) token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) ssh_user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) ssh_host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) ssh_port: Option<u16>,
+}
+
+// Manual Debug so an accidental `{entry:?}` in a log never leaks the access
+// token. All other fields stay visible for diagnostics.
+impl std::fmt::Debug for RemoteConnectionEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteConnectionEntry")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("url", &self.url)
+            .field("token", &"<redacted>")
+            .field("ssh_user", &self.ssh_user)
+            .field("ssh_host", &self.ssh_host)
+            .field("ssh_port", &self.ssh_port)
+            .finish()
+    }
+}
+
+/// Public view of a remote connection: identical to `RemoteConnectionEntry`
+/// minus the access token, which is never sent to the browser.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteConnectionPublic {
     id: String,
     name: String,
     url: String,
-    token: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     ssh_user: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     ssh_host: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     ssh_port: Option<u16>,
 }
 
-const REMOTE_CONNECTIONS_FILE: &str = "remote-connections.json";
-const REMOTE_CONNECTIONS_MAX: usize = 100;
+impl From<&RemoteConnectionEntry> for RemoteConnectionPublic {
+    fn from(entry: &RemoteConnectionEntry) -> Self {
+        Self {
+            id: entry.id.clone(),
+            name: entry.name.clone(),
+            url: entry.url.clone(),
+            ssh_user: entry.ssh_user.clone(),
+            ssh_host: entry.ssh_host.clone(),
+            ssh_port: entry.ssh_port,
+        }
+    }
+}
 
-fn remote_connections_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+/// Incoming remote connection from a PUT. The browser no longer holds tokens,
+/// so `token` is optional/empty; the merge step keeps the stored token when the
+/// client omits it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct RemoteConnectionInput {
+    id: String,
+    name: String,
+    url: String,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    ssh_user: Option<String>,
+    #[serde(default)]
+    ssh_host: Option<String>,
+    #[serde(default)]
+    ssh_port: Option<u16>,
+}
+
+/// Write-only-merge: for each incoming entry, keep the previously stored token
+/// when the client sends an empty/absent token for an existing id. Pure so it
+/// can be unit-tested without an `AppState`.
+pub(super) fn merge_put_entries(
+    existing: &[RemoteConnectionEntry],
+    incoming: Vec<RemoteConnectionInput>,
+) -> Vec<RemoteConnectionEntry> {
+    incoming
+        .into_iter()
+        .map(|input| {
+            let provided = input
+                .token
+                .as_deref()
+                .map(str::trim)
+                .filter(|token| !token.is_empty());
+            let token = match provided {
+                Some(token) => token.to_string(),
+                None => existing
+                    .iter()
+                    .find(|entry| entry.id == input.id)
+                    .map(|entry| entry.token.clone())
+                    .unwrap_or_default(),
+            };
+            RemoteConnectionEntry {
+                id: input.id,
+                name: input.name,
+                url: input.url,
+                token,
+                ssh_user: input.ssh_user,
+                ssh_host: input.ssh_host,
+                ssh_port: input.ssh_port,
+            }
+        })
+        .collect()
+}
+
+const REMOTE_CONNECTIONS_FILE: &str = "remote-connections.json";
+pub(super) const REMOTE_CONNECTIONS_MAX: usize = 100;
+
+pub(super) fn remote_connections_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     let app_data_dir = app
         .path()
         .app_data_dir()
@@ -473,7 +601,7 @@ fn remote_connections_path(app: &AppHandle) -> Result<std::path::PathBuf, String
 
 /// Missing or corrupt files yield an empty list — the browser falls back to
 /// an empty picker rather than failing to boot.
-fn load_remote_connections(path: &std::path::Path) -> Vec<RemoteConnectionEntry> {
+pub(super) fn load_remote_connections(path: &std::path::Path) -> Vec<RemoteConnectionEntry> {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -518,23 +646,27 @@ async fn get_remote_connections_handler(
         Ok(path) => path,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    Json(load_remote_connections(&path)).into_response()
+    let public: Vec<RemoteConnectionPublic> = load_remote_connections(&path)
+        .iter()
+        .map(RemoteConnectionPublic::from)
+        .collect();
+    Json(public).into_response()
 }
 
 async fn put_remote_connections_handler(
     headers: HeaderMap,
     Query(params): Query<WsAuth>,
     State(state): State<AppState>,
-    Json(entries): Json<Vec<RemoteConnectionEntry>>,
+    Json(incoming): Json<Vec<RemoteConnectionInput>>,
 ) -> Response {
     if let Err(response) = validate_token(&params, &headers, &state) {
         return response;
     }
 
-    if entries.len() > REMOTE_CONNECTIONS_MAX {
+    if incoming.len() > REMOTE_CONNECTIONS_MAX {
         return (StatusCode::PAYLOAD_TOO_LARGE, "Too many remote connections").into_response();
     }
-    if entries
+    if incoming
         .iter()
         .any(|entry| entry.id.trim().is_empty() || entry.url.trim().is_empty())
     {
@@ -549,6 +681,10 @@ async fn put_remote_connections_handler(
         Ok(path) => path,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
+    // Merge against the stored list so tokens survive a browser that no longer
+    // holds them (it PUTs an empty token for existing ids).
+    let existing = load_remote_connections(&path);
+    let entries = merge_put_entries(&existing, incoming);
     match save_remote_connections(&path, &entries) {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(e) => {
@@ -639,6 +775,23 @@ async fn load_active_sessions_windowed(
 /// user lands on (project list + currently-selected project's worktrees +
 /// windowed messages for the focused session). Additional data is lazy-loaded
 /// by the frontend via TanStack Query hooks when the user navigates.
+/// Strip secret preference values from an `/api/init` payload, replacing each
+/// with a `<key>_configured: bool` marker (mirrors `server_preferences_value`).
+/// Unlike that helper, client-only UI keys (theme, fonts, …) are kept because
+/// the browser needs them to render. Secrets must never reach any client.
+fn redact_preference_secrets(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    for key in ["linear_api_key", "sentry_auth_token", "http_server_token"] {
+        let configured = object
+            .get(key)
+            .is_some_and(|value| value.as_str().is_some_and(|secret| !secret.is_empty()));
+        object.remove(key);
+        object.insert(format!("{key}_configured"), Value::Bool(configured));
+    }
+}
+
 async fn init_handler(
     headers: HeaderMap,
     Query(params): Query<WsAuth>,
@@ -946,7 +1099,8 @@ async fn init_handler(
 
     match preferences_result {
         Ok(preferences) => {
-            if let Ok(val) = serde_json::to_value(&preferences) {
+            if let Ok(mut val) = serde_json::to_value(&preferences) {
+                redact_preference_secrets(&mut val);
                 response["preferences"] = val;
             }
         }
@@ -1086,6 +1240,13 @@ async fn file_handler(
         return (StatusCode::NOT_FOUND, "Not a file").into_response();
     }
 
+    // Never expose secret-bearing files, even to an authenticated client. The
+    // token itself is enough to read app data, but these hold OTHER servers'
+    // tokens / API keys and are not asset content the browser should fetch.
+    if is_secret_app_data_file(&canonical) {
+        return (StatusCode::FORBIDDEN, "Access denied").into_response();
+    }
+
     // Read and serve the file
     let mime = mime_from_extension(&canonical);
     match tokio::fs::read(&canonical).await {
@@ -1097,6 +1258,24 @@ async fn file_handler(
             .into_response(),
         Err(_) => (StatusCode::NOT_FOUND, "Cannot read file").into_response(),
     }
+}
+
+/// True for app-data files that hold secrets and must never be served over the
+/// file endpoint. Matches on the final (canonicalized) file name.
+fn is_secret_app_data_file(path: &std::path::Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if matches!(
+        name,
+        "remote-connections.json" | "preferences.json" | "projects.json"
+    ) {
+        return true;
+    }
+    // `Path::extension()` returns None for a bare ".env", so match on the name:
+    // covers ".env", "prod.env", etc.
+    let lower = name.to_ascii_lowercase();
+    lower == ".env" || lower.ends_with(".env")
 }
 
 fn validate_token(params: &WsAuth, headers: &HeaderMap, state: &AppState) -> Result<(), Response> {
@@ -1402,7 +1581,11 @@ fn token_from_query_or_bearer(query_token: Option<&str>, headers: &HeaderMap) ->
         .map(ToOwned::to_owned)
 }
 
-fn request_is_authorized(query_token: Option<&str>, headers: &HeaderMap, expected: &str) -> bool {
+pub(super) fn request_is_authorized(
+    query_token: Option<&str>,
+    headers: &HeaderMap,
+    expected: &str,
+) -> bool {
     token_from_query_or_bearer(query_token, headers)
         .as_deref()
         .is_some_and(|provided| auth::validate_token(provided, expected))
@@ -1527,9 +1710,9 @@ mod tests {
     use super::{
         bind_host_option_label, bind_host_option_rank, display_host_for_bind_ip,
         display_ip_for_bind_ip_with_candidates, embedded_asset_path_for_request, format_http_url,
-        is_tailscale_ipv4, load_remote_connections, parse_bind_ip, path_is_in_known_roots,
-        save_remote_connections, token_from_query_or_bearer, validate_bind_host,
-        RemoteConnectionEntry,
+        is_secret_app_data_file, is_tailscale_ipv4, load_remote_connections, merge_put_entries,
+        parse_bind_ip, path_is_in_known_roots, save_remote_connections, token_from_query_or_bearer,
+        validate_bind_host, RemoteConnectionEntry, RemoteConnectionInput, RemoteConnectionPublic,
     };
     use axum::http::{HeaderMap, HeaderValue};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -1881,5 +2064,113 @@ mod tests {
 
         std::fs::write(&missing, "{not json").unwrap();
         assert!(load_remote_connections(&missing).is_empty());
+    }
+
+    fn sample_entry(id: &str, token: &str) -> RemoteConnectionEntry {
+        RemoteConnectionEntry {
+            id: id.into(),
+            name: "name".into(),
+            url: "https://remote.example".into(),
+            token: token.into(),
+            ssh_user: None,
+            ssh_host: None,
+            ssh_port: None,
+        }
+    }
+
+    #[test]
+    fn public_view_never_serializes_token() {
+        let entry = sample_entry("a", "super-secret");
+        let value = serde_json::to_value(RemoteConnectionPublic::from(&entry)).unwrap();
+        let object = value.as_object().unwrap();
+        assert!(!object.contains_key("token"));
+        assert_eq!(object.get("id").unwrap(), "a");
+        assert_eq!(object.get("url").unwrap(), "https://remote.example");
+        // The secret string must not appear anywhere in the serialized form.
+        assert!(!value.to_string().contains("super-secret"));
+    }
+
+    #[test]
+    fn merge_put_keeps_stored_token_when_incoming_is_empty() {
+        let existing = vec![sample_entry("a", "stored-token")];
+
+        // Empty-string token and absent token both preserve the stored value.
+        let incoming = vec![
+            RemoteConnectionInput {
+                id: "a".into(),
+                name: "renamed".into(),
+                url: "https://remote.example".into(),
+                token: Some("   ".into()),
+                ssh_user: None,
+                ssh_host: None,
+                ssh_port: None,
+            },
+            RemoteConnectionInput {
+                id: "b".into(),
+                name: "new".into(),
+                url: "https://other.example".into(),
+                token: Some("fresh-token".into()),
+                ssh_user: None,
+                ssh_host: None,
+                ssh_port: None,
+            },
+        ];
+
+        let merged = merge_put_entries(&existing, incoming);
+        assert_eq!(merged.len(), 2);
+        // Existing id keeps its stored token but takes the new name.
+        assert_eq!(merged[0].token, "stored-token");
+        assert_eq!(merged[0].name, "renamed");
+        // New id uses the provided token.
+        assert_eq!(merged[1].token, "fresh-token");
+    }
+
+    #[test]
+    fn merge_put_new_id_with_empty_token_yields_empty_token() {
+        let merged = merge_put_entries(
+            &[],
+            vec![RemoteConnectionInput {
+                id: "brand-new".into(),
+                name: "n".into(),
+                url: "https://remote.example".into(),
+                token: None,
+                ssh_user: None,
+                ssh_host: None,
+                ssh_port: None,
+            }],
+        );
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].token.is_empty());
+    }
+
+    #[test]
+    fn secret_app_data_files_are_rejected() {
+        assert!(is_secret_app_data_file(std::path::Path::new(
+            "/data/remote-connections.json"
+        )));
+        assert!(is_secret_app_data_file(std::path::Path::new(
+            "/data/preferences.json"
+        )));
+        assert!(is_secret_app_data_file(std::path::Path::new(
+            "/data/projects.json"
+        )));
+        assert!(is_secret_app_data_file(std::path::Path::new("/data/.env")));
+        assert!(is_secret_app_data_file(std::path::Path::new(
+            "/data/prod.env"
+        )));
+        assert!(!is_secret_app_data_file(std::path::Path::new(
+            "/data/avatar.png"
+        )));
+        assert!(!is_secret_app_data_file(std::path::Path::new(
+            "/data/sessions.json"
+        )));
+    }
+
+    #[test]
+    fn debug_redacts_token() {
+        let entry = sample_entry("a", "super-secret");
+        let rendered = format!("{entry:?}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("super-secret"));
     }
 }
