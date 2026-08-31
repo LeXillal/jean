@@ -31,6 +31,9 @@ struct AppState {
     token_required: bool,
     localhost_only: bool,
     dist_path: std::path::PathBuf,
+    /// HMAC key that signs web session cookies. Shared (Arc) because AppState is
+    /// cloned per request. Loaded once at startup from app-data.
+    session_key: Arc<Vec<u8>>,
 }
 
 /// Server handle for shutdown coordination.
@@ -210,12 +213,23 @@ pub async fn start_server(
     // Resolve the dist directory at runtime for static file serving
     let dist_path = resolve_dist_path(&app);
 
+    // Load (or create) the key that signs session cookies. Persisted in
+    // app-data so sessions survive restarts.
+    let session_key = {
+        let dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("Failed to resolve app data dir: {e}"))?;
+        Arc::new(auth::load_or_create_session_key(&dir)?)
+    };
+
     let state = AppState {
         app: app.clone(),
         token: token.clone(),
         token_required,
         localhost_only,
         dist_path: dist_path.clone(),
+        session_key,
     };
 
     let cors = cors_layer_from_env();
@@ -225,6 +239,8 @@ pub async fn start_server(
         .route("/readyz", get(ready_handler))
         .route("/ws", get(ws_handler))
         .route("/api/auth", get(auth_handler))
+        .route("/api/login", post(login_handler))
+        .route("/api/logout", post(logout_handler))
         .route("/api/commit-jobs", post(start_commit_job_handler))
         .route("/api/init", get(init_handler))
         .route("/api/version", get(version_handler))
@@ -352,7 +368,7 @@ async fn ws_handler(
 ) -> Response {
     // Validate token (skip if token not required)
     if state.token_required
-        && !request_is_authorized(params.token.as_deref(), &headers, &state.token)
+        && !request_is_authorized(params.token.as_deref(), &headers, &state.token, &state.session_key)
     {
         return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
     }
@@ -390,7 +406,7 @@ async fn auth_handler(
         .into_response();
     }
 
-    if request_is_authorized(params.token.as_deref(), &headers, &state.token) {
+    if request_is_authorized(params.token.as_deref(), &headers, &state.token, &state.session_key) {
         Json(serde_json::json!({
             "ok": true,
             "webBuildId": build_info.web_build_id,
@@ -406,6 +422,92 @@ async fn auth_handler(
     }
 }
 
+#[derive(Deserialize)]
+struct LoginRequest {
+    token: String,
+}
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// True when the request reached us over TLS. We only ever bind plain HTTP, so
+/// TLS is terminated by a reverse proxy / tunnel that sets `X-Forwarded-Proto`.
+/// The `Secure` cookie flag is set only then (so local http dev still works).
+fn request_is_https(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(',')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .eq_ignore_ascii_case("https")
+        })
+        .unwrap_or(false)
+}
+
+fn session_set_cookie(value: &str, secure: bool, max_age: u64) -> String {
+    let mut cookie = format!(
+        "{}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}",
+        auth::SESSION_COOKIE_NAME
+    );
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+fn json_ok_with_cookie(cookie: String) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::SET_COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"ok":true}"#))
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "cookie error").into_response())
+}
+
+/// Exchange the raw token for an HttpOnly session cookie. Keeps the long-lived
+/// token out of the browser's localStorage and out of the WebSocket URL.
+async fn login_handler(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<LoginRequest>,
+) -> Response {
+    // With auth disabled a login is a no-op but harmless.
+    if !state.token_required {
+        return Json(serde_json::json!({ "ok": true, "token_required": false })).into_response();
+    }
+    if !auth::validate_token(body.token.trim(), &state.token) {
+        // Gentle throttle: caps guessing to ~2/sec without a hard lockout (which
+        // a stranger could weaponize to lock the owner out). The 256-bit token
+        // is already infeasible to brute-force; this is defense in depth.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "ok": false, "error": "Invalid token" })),
+        )
+            .into_response();
+    }
+    let value = auth::issue_session_cookie(&state.session_key, now_unix_secs());
+    json_ok_with_cookie(session_set_cookie(
+        &value,
+        request_is_https(&headers),
+        auth::SESSION_TTL_SECS,
+    ))
+}
+
+/// Clear the session cookie. The stateless design means we can only ask the
+/// browser to drop it (there is no server-side session to delete); rotating the
+/// key file is the "revoke everywhere" lever.
+async fn logout_handler(headers: HeaderMap) -> Response {
+    json_ok_with_cookie(session_set_cookie("", request_is_https(&headers), 0))
+}
+
 async fn start_commit_job_handler(
     headers: HeaderMap,
     Query(params): Query<WsAuth>,
@@ -413,7 +515,7 @@ async fn start_commit_job_handler(
     Json(request): Json<StartCommitJobRequest>,
 ) -> Response {
     if state.token_required
-        && !request_is_authorized(params.token.as_deref(), &headers, &state.token)
+        && !request_is_authorized(params.token.as_deref(), &headers, &state.token, &state.session_key)
     {
         return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
     }
@@ -444,7 +546,7 @@ async fn version_handler(
     State(state): State<AppState>,
 ) -> Response {
     if state.token_required
-        && !request_is_authorized(params.token.as_deref(), &headers, &state.token)
+        && !request_is_authorized(params.token.as_deref(), &headers, &state.token, &state.session_key)
     {
         return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
     }
@@ -526,7 +628,7 @@ async fn init_handler(
 ) -> Response {
     // Validate token (skip if token not required)
     if state.token_required
-        && !request_is_authorized(params.token.as_deref(), &headers, &state.token)
+        && !request_is_authorized(params.token.as_deref(), &headers, &state.token, &state.session_key)
     {
         return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
     }
@@ -926,7 +1028,7 @@ async fn file_handler(
 ) -> Response {
     // Validate token
     if state.token_required
-        && !request_is_authorized(params.token.as_deref(), &headers, &state.token)
+        && !request_is_authorized(params.token.as_deref(), &headers, &state.token, &state.session_key)
     {
         return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
     }
@@ -981,7 +1083,7 @@ async fn file_handler(
 
 fn validate_token(params: &WsAuth, headers: &HeaderMap, state: &AppState) -> Result<(), Response> {
     if state.token_required
-        && !request_is_authorized(params.token.as_deref(), headers, &state.token)
+        && !request_is_authorized(params.token.as_deref(), headers, &state.token, &state.session_key)
     {
         return Err((StatusCode::UNAUTHORIZED, "Invalid token").into_response());
     }
@@ -1282,10 +1384,18 @@ fn token_from_query_or_bearer(query_token: Option<&str>, headers: &HeaderMap) ->
         .map(ToOwned::to_owned)
 }
 
-fn request_is_authorized(query_token: Option<&str>, headers: &HeaderMap, expected: &str) -> bool {
-    token_from_query_or_bearer(query_token, headers)
+fn request_is_authorized(
+    query_token: Option<&str>,
+    headers: &HeaderMap,
+    expected: &str,
+    session_key: &[u8],
+) -> bool {
+    // Either a valid raw token (query/bearer, used by native + first login) or a
+    // valid session cookie (browser, after /api/login) authorizes the request.
+    let token_ok = token_from_query_or_bearer(query_token, headers)
         .as_deref()
-        .is_some_and(|provided| auth::validate_token(provided, expected))
+        .is_some_and(|provided| auth::validate_token(provided, expected));
+    token_ok || auth::session_cookie_valid(headers, session_key)
 }
 
 pub fn list_bind_host_options() -> Vec<BindHostOption> {

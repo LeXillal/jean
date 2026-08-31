@@ -117,7 +117,27 @@ interface AutoFixStoppedEvent {
   error: string
 }
 
-function handleWsAuthTokenSubmit(token: string) {
+async function handleWsAuthTokenSubmit(token: string) {
+  // Prefer exchanging the token for an HttpOnly session cookie: it keeps the
+  // long-lived token out of localStorage and out of the WebSocket URL. The
+  // cookie is same-origin, so the browser sends it automatically afterwards.
+  try {
+    const res = await fetch(`${window.location.origin}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ token }),
+    })
+    if (res.ok) {
+      localStorage.removeItem('jean-http-token')
+      window.location.reload()
+      return
+    }
+  } catch {
+    // Endpoint missing (older server) or network error → legacy token path.
+  }
+  // Fallback: store the token so validateAndConnect re-checks it and surfaces
+  // the correct error (or connects, on an older server without /api/login).
   localStorage.setItem('jean-http-token', token)
   window.location.reload()
 }

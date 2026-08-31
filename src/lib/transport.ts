@@ -1191,5 +1191,11 @@ export function signOutOfWebAccess(): void {
   // Reload on a bare origin. A bookmarked `?token=...` takes priority over
   // localStorage on boot, so keeping the current URL would sign us straight
   // back in and make the button look broken.
-  window.location.replace(`${window.location.origin}/`)
+  const leave = () => window.location.replace(`${window.location.origin}/`)
+  // Also clear the server-side session cookie, then leave regardless of the
+  // result (older servers without /api/logout must not block sign-out).
+  fetch(`${window.location.origin}/api/logout`, {
+    method: 'POST',
+    credentials: 'same-origin',
+  }).then(leave, leave)
 }
