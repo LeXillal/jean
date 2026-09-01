@@ -58,7 +58,7 @@ pub async fn start_terminal(
     let (command_args, signal) = match (command.as_deref(), session_id.as_deref()) {
         (Some(command), Some(session_id)) => {
             let had_args = command_args.is_some();
-            let (args, signal) = super::attention::inject_codex_notify(
+            let (args, signal) = super::attention::inject_terminal_signals(
                 &app,
                 session_id,
                 command,
@@ -69,7 +69,10 @@ pub async fn start_terminal(
             } else {
                 None
             };
-            (args, signal.map(|path| (session_id.to_string(), path)))
+            (
+                args,
+                signal.map(|(kind, path)| (session_id.to_string(), kind, path)),
+            )
         }
         _ => (command_args, None),
     };
@@ -84,8 +87,8 @@ pub async fn start_terminal(
         command_args,
         session_id,
     )?;
-    if let Some((session_id, signal_path)) = signal {
-        super::attention::spawn_signal_tailer(app, session_id, terminal_id, signal_path);
+    if let Some((session_id, kind, signal_path)) = signal {
+        super::attention::spawn_signal_tailer(app, session_id, terminal_id, signal_path, kind);
     }
     Ok(())
 }
