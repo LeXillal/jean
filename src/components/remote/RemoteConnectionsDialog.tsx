@@ -21,18 +21,21 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Switch } from '@/components/ui/switch'
 import { Spinner } from '@/components/ui/spinner'
 import { isNativeApp } from '@/lib/environment'
 import { cn } from '@/lib/utils'
 import {
   LOCAL_CONNECTION_ID,
   addRemoteConnection,
+  aggregatesSessions,
   getActiveConnectionId,
   markConnectionSwitch,
   parseOptionalSshPort,
   parseRemoteConnectionInput,
   removeRemoteConnection,
   selectConnection,
+  setConnectionAggregation,
   updateRemoteConnection,
   useRemoteConnections,
   type RemoteConnection,
@@ -460,6 +463,16 @@ export function RemoteConnectionsDialog({
     }
   }
 
+  const handleToggleAggregation = async (id: string, enabled: boolean) => {
+    try {
+      await setConnectionAggregation(id, enabled)
+    } catch (toggleError) {
+      setError(
+        toggleError instanceof Error ? toggleError.message : String(toggleError)
+      )
+    }
+  }
+
   const isNew = editingId === 'new'
   const showInstallForm = isNew && addMode === 'install'
 
@@ -809,6 +822,15 @@ export function RemoteConnectionsDialog({
                   onSelect={() => void switchTo(connection.id)}
                   onEdit={() => beginEdit(connection)}
                   onDelete={() => handleDelete(connection.id)}
+                  aggregate={
+                    native ? undefined : aggregatesSessions(connection)
+                  }
+                  onToggleAggregate={
+                    native
+                      ? undefined
+                      : enabled =>
+                          void handleToggleAggregation(connection.id, enabled)
+                  }
                 />
               )
             })}
@@ -891,6 +913,8 @@ function ConnectionRow({
   onSelect,
   onEdit,
   onDelete,
+  aggregate,
+  onToggleAggregate,
 }: {
   name: string
   detail: string
@@ -901,8 +925,12 @@ function ConnectionRow({
   onSelect: () => void
   onEdit?: () => void
   onDelete?: () => void
+  /** Undefined for rows that cannot opt out (the local server). */
+  aggregate?: boolean
+  onToggleAggregate?: (enabled: boolean) => void
 }) {
   const hasActions = Boolean(onEdit || onDelete)
+  const showAggregate = aggregate !== undefined && Boolean(onToggleAggregate)
 
   return (
     <div className="rounded-md border p-2">
@@ -947,6 +975,23 @@ function ConnectionRow({
         >
           {detail}
         </button>
+        {showAggregate && (
+          <div className="flex shrink-0 items-center gap-1.5 pr-1">
+            <Label
+              htmlFor={`aggregate-${name}`}
+              className="cursor-pointer text-xs font-normal text-muted-foreground"
+              title="Show this instance's sessions in the sidebar. Off keeps it switch-only."
+            >
+              In sidebar
+            </Label>
+            <Switch
+              id={`aggregate-${name}`}
+              checked={aggregate}
+              onCheckedChange={onToggleAggregate}
+              aria-label={`Show ${name} sessions in the sidebar`}
+            />
+          </div>
+        )}
         {hasActions && (
           <div className="flex shrink-0 items-center gap-0.5">
             {onEdit && (

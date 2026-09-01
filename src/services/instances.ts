@@ -20,6 +20,7 @@ import { useEffect, useMemo, useSyncExternalStore } from 'react'
 import { useQueries, useQueryClient } from '@tanstack/react-query'
 import {
   LOCAL_CONNECTION_ID,
+  aggregatesSessions,
   getActiveConnectionId,
   useRemoteConnections,
 } from '@/lib/remote-connections'
@@ -53,6 +54,19 @@ export interface JeanInstance {
   status: InstanceStatus
   /** The instance the main UI is currently driving. */
   isFocused: boolean
+  /**
+   * Whether this instance contributes its sessions to the sidebar. When false
+   * it stays reachable by switching to it, but costs nothing in the background.
+   */
+  aggregate: boolean
+}
+
+/**
+ * The instances read in the background: every aggregated instance except the
+ * focused one, which the main UI already drives.
+ */
+export function satelliteInstances(instances: JeanInstance[]): JeanInstance[] {
+  return instances.filter(instance => !instance.isFocused && instance.aggregate)
 }
 
 /** A session plus the instance it belongs to. */
@@ -190,8 +204,14 @@ export function useInstances(): JeanInstance[] {
   return useMemo(() => {
     void version
     const entries = [
-      { id: LOCAL_CONNECTION_ID, name: LOCAL_INSTANCE_NAME },
-      ...connections.map(item => ({ id: item.id, name: item.name })),
+      // The local server is what the browser is already talking to, so it has
+      // no background cost to opt out of.
+      { id: LOCAL_CONNECTION_ID, name: LOCAL_INSTANCE_NAME, aggregate: true },
+      ...connections.map(item => ({
+        id: item.id,
+        name: item.name,
+        aggregate: aggregatesSessions(item),
+      })),
     ]
     return entries.map(entry => ({
       ...entry,
@@ -211,8 +231,7 @@ export function useInstances(): JeanInstance[] {
 export function useSatelliteTransports(instances: JeanInstance[]): void {
   const wantedIds = useMemo(
     () =>
-      instances
-        .filter(instance => !instance.isFocused)
+      satelliteInstances(instances)
         .map(instance => instance.id)
         .join(','),
     [instances]
@@ -223,8 +242,8 @@ export function useSatelliteTransports(instances: JeanInstance[]): void {
     const wanted = wantedIds ? wantedIds.split(',') : []
     for (const id of wanted) ensureSatelliteTransport(id)
 
-    // Drop transports for connections that disappeared from the list, so a
-    // deleted remote stops holding a socket open.
+    // Drop transports for connections that disappeared from the list — or that
+    // just had aggregation turned off — so they stop holding a socket open.
     const focusedId = getActiveConnectionId()
     for (const id of getLiveTransportIds()) {
       if (id === focusedId || wanted.includes(id)) continue
@@ -244,8 +263,7 @@ export function useSatelliteSessionRefresh(instances: JeanInstance[]): void {
   const queryClient = useQueryClient()
   const satelliteIds = useMemo(
     () =>
-      instances
-        .filter(instance => !instance.isFocused)
+      satelliteInstances(instances)
         .map(instance => instance.id)
         .join(','),
     [instances]

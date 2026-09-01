@@ -686,6 +686,11 @@ pub(super) struct RemoteConnectionEntry {
     pub(super) ssh_host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) ssh_port: Option<u16>,
+    /// Aggregate this instance's sessions in the client sidebar. `None` means
+    /// the default (on): entries written before the toggle existed keep
+    /// aggregating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) aggregate_sessions: Option<bool>,
 }
 
 // Manual Debug so an accidental `{entry:?}` in a log never leaks the access
@@ -700,6 +705,7 @@ impl std::fmt::Debug for RemoteConnectionEntry {
             .field("ssh_user", &self.ssh_user)
             .field("ssh_host", &self.ssh_host)
             .field("ssh_port", &self.ssh_port)
+            .field("aggregate_sessions", &self.aggregate_sessions)
             .finish()
     }
 }
@@ -718,6 +724,8 @@ struct RemoteConnectionPublic {
     ssh_host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ssh_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aggregate_sessions: Option<bool>,
 }
 
 impl From<&RemoteConnectionEntry> for RemoteConnectionPublic {
@@ -729,6 +737,7 @@ impl From<&RemoteConnectionEntry> for RemoteConnectionPublic {
             ssh_user: entry.ssh_user.clone(),
             ssh_host: entry.ssh_host.clone(),
             ssh_port: entry.ssh_port,
+            aggregate_sessions: entry.aggregate_sessions,
         }
     }
 }
@@ -750,6 +759,8 @@ pub(super) struct RemoteConnectionInput {
     ssh_host: Option<String>,
     #[serde(default)]
     ssh_port: Option<u16>,
+    #[serde(default)]
+    aggregate_sessions: Option<bool>,
 }
 
 /// Write-only-merge: for each incoming entry, keep the previously stored token
@@ -783,6 +794,7 @@ pub(super) fn merge_put_entries(
                 ssh_user: input.ssh_user,
                 ssh_host: input.ssh_host,
                 ssh_port: input.ssh_port,
+                aggregate_sessions: input.aggregate_sessions,
             }
         })
         .collect()
@@ -2247,6 +2259,7 @@ mod tests {
                 ssh_user: Some("root".into()),
                 ssh_host: Some("192.168.1.61".into()),
                 ssh_port: Some(2222),
+                aggregate_sessions: Some(false),
             },
             RemoteConnectionEntry {
                 id: "b".into(),
@@ -2256,6 +2269,7 @@ mod tests {
                 ssh_user: None,
                 ssh_host: None,
                 ssh_port: None,
+                aggregate_sessions: None,
             },
         ];
 
@@ -2265,6 +2279,9 @@ mod tests {
         // Optional SSH fields are omitted from the stored JSON entirely.
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("\"sshUser\": null"));
+        // The sidebar opt-out survives a round trip; the default stays absent.
+        assert!(raw.contains("\"aggregateSessions\": false"));
+        assert_eq!(load_remote_connections(&path)[1].aggregate_sessions, None);
 
         #[cfg(unix)]
         {
@@ -2293,6 +2310,7 @@ mod tests {
             ssh_user: None,
             ssh_host: None,
             ssh_port: None,
+            aggregate_sessions: None,
         }
     }
 
@@ -2322,6 +2340,7 @@ mod tests {
                 ssh_user: None,
                 ssh_host: None,
                 ssh_port: None,
+                aggregate_sessions: None,
             },
             RemoteConnectionInput {
                 id: "b".into(),
@@ -2331,6 +2350,7 @@ mod tests {
                 ssh_user: None,
                 ssh_host: None,
                 ssh_port: None,
+                aggregate_sessions: None,
             },
         ];
 
@@ -2341,6 +2361,33 @@ mod tests {
         assert_eq!(merged[0].name, "renamed");
         // New id uses the provided token.
         assert_eq!(merged[1].token, "fresh-token");
+    }
+
+    #[test]
+    fn merge_put_round_trips_the_sidebar_opt_out() {
+        let merged = merge_put_entries(
+            &[sample_entry("a", "stored-token")],
+            vec![RemoteConnectionInput {
+                id: "a".into(),
+                name: "n".into(),
+                url: "https://remote.example".into(),
+                token: None,
+                ssh_user: None,
+                ssh_host: None,
+                ssh_port: None,
+                aggregate_sessions: Some(false),
+            }],
+        );
+        assert_eq!(merged[0].aggregate_sessions, Some(false));
+        // The flag is client-owned: it is never inherited from the stored
+        // entry the way the write-only token is.
+        assert_eq!(
+            serde_json::to_value(RemoteConnectionPublic::from(&merged[0]))
+                .unwrap()
+                .get("aggregateSessions")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
     }
 
     #[test]
@@ -2355,6 +2402,7 @@ mod tests {
                 ssh_user: None,
                 ssh_host: None,
                 ssh_port: None,
+                aggregate_sessions: None,
             }],
         );
         assert_eq!(merged.len(), 1);

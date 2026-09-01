@@ -6,20 +6,30 @@ import type { AllSessionsResponse, Session } from '@/types/chat'
 
 const noop = () => undefined
 
-const { invokeOn, listenOn, getInstanceStatus } = vi.hoisted(() => ({
+const {
+  invokeOn,
+  listenOn,
+  getInstanceStatus,
+  ensureSatelliteTransport,
+  releaseTransport,
+  liveTransportIds,
+} = vi.hoisted(() => ({
   invokeOn: vi.fn(),
   listenOn: vi.fn(async () => noop),
   getInstanceStatus: vi.fn(() => 'connected'),
+  ensureSatelliteTransport: vi.fn(),
+  releaseTransport: vi.fn(),
+  liveTransportIds: { current: [] as string[] },
 }))
 
 vi.mock('@/lib/transport', () => ({
-  ensureSatelliteTransport: vi.fn(),
+  ensureSatelliteTransport,
   getInstanceStatus,
-  getLiveTransportIds: () => [],
+  getLiveTransportIds: () => liveTransportIds.current,
   getTransportRegistryVersion: () => 0,
   invokeOn,
   listenOn,
-  releaseTransport: vi.fn(),
+  releaseTransport,
   subscribeToTransports: () => noop,
 }))
 
@@ -31,8 +41,10 @@ import {
   consumePendingSessionOpen,
   deriveSatelliteSessionStatus,
   instanceSessionKey,
+  satelliteInstances,
   setPendingSessionOpen,
   useInstanceSessions,
+  useSatelliteTransports,
   type JeanInstance,
 } from './instances'
 
@@ -66,8 +78,19 @@ function makeResponse(
   }
 }
 
-function instance(id: string, name: string): JeanInstance {
-  return { id, name, status: 'connected', isFocused: false }
+function instance(
+  id: string,
+  name: string,
+  overrides: Partial<JeanInstance> = {}
+): JeanInstance {
+  return {
+    id,
+    name,
+    status: 'connected',
+    isFocused: false,
+    aggregate: true,
+    ...overrides,
+  }
 }
 
 function wrapper({ children }: { children: ReactNode }) {
@@ -246,5 +269,53 @@ describe('useInstanceSessions', () => {
       'recent',
       'old',
     ])
+  })
+})
+
+describe('sidebar aggregation opt-out', () => {
+  beforeEach(() => {
+    ensureSatelliteTransport.mockClear()
+    releaseTransport.mockClear()
+    liveTransportIds.current = []
+  })
+
+  it('excludes the focused instance and the opted-out ones', () => {
+    const instances = [
+      instance('local', 'This server', { isFocused: true }),
+      instance('a', 'A'),
+      instance('b', 'B', { aggregate: false }),
+    ]
+    expect(satelliteInstances(instances).map(item => item.id)).toEqual(['a'])
+  })
+
+  it('opens no background transport for an opted-out instance', () => {
+    renderHook(
+      () =>
+        useSatelliteTransports([
+          instance('local', 'This server', { isFocused: true }),
+          instance('a', 'A'),
+          instance('b', 'B', { aggregate: false }),
+        ]),
+      { wrapper }
+    )
+
+    expect(ensureSatelliteTransport).toHaveBeenCalledTimes(1)
+    expect(ensureSatelliteTransport).toHaveBeenCalledWith('a')
+  })
+
+  it('releases the transport of an instance that was just opted out', () => {
+    liveTransportIds.current = ['local', 'b']
+    renderHook(
+      () =>
+        useSatelliteTransports([
+          instance('local', 'This server', { isFocused: true }),
+          instance('b', 'B', { aggregate: false }),
+        ]),
+      { wrapper }
+    )
+
+    expect(releaseTransport).toHaveBeenCalledWith('b')
+    // The focused instance drives the main UI: never release it.
+    expect(releaseTransport).not.toHaveBeenCalledWith('local')
   })
 })

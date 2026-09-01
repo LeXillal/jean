@@ -36,6 +36,7 @@ function instance(overrides: Partial<JeanInstance> = {}): JeanInstance {
     name: 'Server A',
     status: 'connected',
     isFocused: false,
+    aggregate: true,
     ...overrides,
   }
 }

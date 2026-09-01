@@ -472,6 +472,7 @@ mod tests {
             ssh_user: None,
             ssh_host: None,
             ssh_port: None,
+            aggregate_sessions: None,
         }
     }
 

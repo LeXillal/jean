@@ -26,6 +26,13 @@ export interface RemoteConnection {
   sshHost?: string
   /** SSH port (default 22 when omitted). */
   sshPort?: number
+  /**
+   * Aggregate this instance's sessions into the sidebar. Omitted means `true`:
+   * connections created before the toggle existed keep aggregating.
+   * When `false` the instance is switch-only — no background transport, no
+   * sidebar section.
+   */
+  aggregateSessions?: boolean
 }
 
 export interface RemoteConnectionInput {
@@ -36,6 +43,13 @@ export interface RemoteConnectionInput {
   sshUser?: string
   sshHost?: string
   sshPort?: number
+  /** Omitted keeps the stored value (or the `true` default for a new one). */
+  aggregateSessions?: boolean
+}
+
+/** Whether this instance's sessions show up in the sidebar. Missing = on. */
+export function aggregatesSessions(connection: RemoteConnection): boolean {
+  return connection.aggregateSessions !== false
 }
 
 /** Parse a user-entered SSH port string; empty → undefined. Throws on invalid. */
@@ -105,6 +119,8 @@ function normalizeConnection(item: unknown): RemoteConnection | null {
   if (sshUser) connection.sshUser = sshUser
   if (sshHost) connection.sshHost = sshHost
   if (sshPort) connection.sshPort = sshPort
+  // Only the explicit opt-out is kept; anything else falls back to the default.
+  if (record.aggregateSessions === false) connection.aggregateSessions = false
 
   return connection
 }
@@ -265,6 +281,7 @@ export async function addRemoteConnection(
     ...sshFieldsFromInput(input),
   }
   if (normalized.token) connection.token = normalized.token
+  if (input.aggregateSessions === false) connection.aggregateSessions = false
   await persistConnections([...getRemoteConnections(), connection])
   return connection
 }
@@ -289,6 +306,10 @@ export async function updateRemoteConnection(
   // keep the previously stored one (web clients never see the masked token).
   const token = normalized.token || existing.token
   if (token) updated.token = token
+  // The edit form does not own this flag: an omitted value keeps the toggle
+  // where the sidebar list left it.
+  const aggregate = input.aggregateSessions ?? existing.aggregateSessions
+  if (aggregate === false) updated.aggregateSessions = false
   await persistConnections(
     connections.map(connection => (connection.id === id ? updated : connection))
   )
@@ -302,6 +323,31 @@ export async function removeRemoteConnection(id: string): Promise<void> {
   // Compare the raw saved id: the lazy getter already resolves a removed
   // connection to 'local', which would skip clearing the stored selection.
   if (activeConnectionSnapshot === id) selectConnection(LOCAL_CONNECTION_ID)
+}
+
+/**
+ * Turn sidebar aggregation on or off for one connection.
+ *
+ * Kept out of `updateRemoteConnection` on purpose: the toggle lives in the
+ * connections list, not in the edit form, and must not require re-entering a
+ * token to flip.
+ */
+export async function setConnectionAggregation(
+  id: string,
+  enabled: boolean
+): Promise<void> {
+  const connections = getRemoteConnections()
+  const existing = connections.find(connection => connection.id === id)
+  if (!existing || aggregatesSessions(existing) === enabled) return
+  await persistConnections(
+    connections.map(connection => {
+      if (connection.id !== id) return connection
+      const next = { ...connection }
+      if (enabled) delete next.aggregateSessions
+      else next.aggregateSessions = false
+      return next
+    })
+  )
 }
 
 export function getActiveConnectionId(): string {

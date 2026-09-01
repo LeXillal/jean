@@ -192,6 +192,79 @@ describe('remote connections', () => {
     expect(getRemoteConnections()[0]?.token).toBe('second')
   })
 
+  describe('sidebar aggregation flag', () => {
+    it('defaults to on and persists only the opt-out', async () => {
+      const module = await loadModule()
+      const connection = await module.addRemoteConnection({
+        name: 'A',
+        url: 'http://a.local:3456',
+        token: 't',
+      })
+
+      expect(module.aggregatesSessions(connection)).toBe(true)
+      expect(connection).not.toHaveProperty('aggregateSessions')
+
+      await module.setConnectionAggregation(connection.id, false)
+      const [stored] = module.getRemoteConnections()
+      expect(stored && module.aggregatesSessions(stored)).toBe(false)
+      expect(store.get('jean-remote-connections')).toContain(
+        '"aggregateSessions":false'
+      )
+
+      // Turning it back on drops the field rather than storing `true`.
+      await module.setConnectionAggregation(connection.id, true)
+      expect(module.getRemoteConnections()[0]).not.toHaveProperty(
+        'aggregateSessions'
+      )
+    })
+
+    it('survives a reload and an edit that does not mention it', async () => {
+      store.set(
+        'jean-remote-connections',
+        JSON.stringify([
+          {
+            id: 'a',
+            name: 'A',
+            url: 'http://a.local:3456',
+            token: 't',
+            aggregateSessions: false,
+          },
+        ])
+      )
+
+      const module = await loadModule()
+      const [stored] = module.getRemoteConnections()
+      expect(stored && module.aggregatesSessions(stored)).toBe(false)
+
+      // The edit form has no aggregation field; editing must not silently
+      // re-enable it.
+      const updated = await module.updateRemoteConnection('a', {
+        name: 'Renamed',
+        url: 'http://a.local:3456',
+      })
+      expect(module.aggregatesSessions(updated)).toBe(false)
+    })
+
+    it('ignores a bogus stored value instead of dropping the connection', async () => {
+      store.set(
+        'jean-remote-connections',
+        JSON.stringify([
+          {
+            id: 'a',
+            name: 'A',
+            url: 'http://a.local:3456',
+            aggregateSessions: 'nope',
+          },
+        ])
+      )
+
+      const module = await loadModule()
+      const [stored] = module.getRemoteConnections()
+      expect(module.getRemoteConnections()).toHaveLength(1)
+      expect(stored && module.aggregatesSessions(stored)).toBe(true)
+    })
+  })
+
   describe('web mode (server-side connection store)', () => {
     const serverEntry = {
       id: 'srv-1',

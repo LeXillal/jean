@@ -7,6 +7,7 @@ import { isNativeApp } from '@/lib/environment'
 import {
   consumePendingSessionOpen,
   setPendingSessionOpen,
+  satelliteInstances,
   useInstanceSessions,
   useInstances,
   useSatelliteSessionRefresh,
@@ -58,8 +59,8 @@ interface SatelliteInstancesProps {
 }
 
 /**
- * Sessions from every Jean instance that is NOT the focused one, grouped under
- * a header per instance.
+ * Sessions from every Jean instance that is NOT the focused one and has sidebar
+ * aggregation enabled, grouped under a header per instance.
  *
  * The focused instance keeps its full project tree above; these sections are
  * the aggregated half of the sidebar. Native desktop is excluded: it has no
@@ -72,8 +73,7 @@ export function SatelliteInstances({ ready }: SatelliteInstancesProps) {
   // never connect, leaking its wake listeners and hanging on the command
   // timeout — all for a component that renders null here.
   const satellites = useMemo(
-    () =>
-      isNativeApp() ? [] : instances.filter(instance => !instance.isFocused),
+    () => (isNativeApp() ? [] : satelliteInstances(instances)),
     [instances]
   )
 

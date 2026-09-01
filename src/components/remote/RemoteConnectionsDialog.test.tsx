@@ -14,6 +14,7 @@ const {
   listenLocal,
   updateRemoteConnection,
   useRemoteConnections,
+  setConnectionAggregation,
 } = vi.hoisted(() => ({
   addRemoteConnection: vi.fn(() => ({ id: 'remote-1' })),
   selectConnection: vi.fn(),
@@ -36,6 +37,7 @@ const {
   }),
   updateRemoteConnection: vi.fn(async () => ({ id: 'remote-1' })),
   useRemoteConnections: vi.fn(() => [] as unknown[]),
+  setConnectionAggregation: vi.fn(async () => undefined),
 }))
 
 vi.mock('@/lib/remote-connections', () => ({
@@ -64,8 +66,11 @@ vi.mock('@/lib/remote-connections', () => ({
     }
   },
   selectConnection,
+  setConnectionAggregation,
   updateRemoteConnection,
   useRemoteConnections,
+  aggregatesSessions: (connection: { aggregateSessions?: boolean }) =>
+    connection.aggregateSessions !== false,
 }))
 
 vi.mock('@/lib/remote-version', () => ({
@@ -315,5 +320,68 @@ describe('RemoteConnectionsDialog', () => {
     expect(
       screen.getByRole('button', { name: 'Save & Connect' })
     ).toBeInTheDocument()
+  })
+})
+
+describe('RemoteConnectionsDialog sidebar toggle', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    isNativeApp.mockReturnValue(false)
+    useRemoteConnections.mockReturnValue([
+      { id: 'conn-1', name: 'ses-temps', url: 'https://jean.example.com' },
+    ])
+  })
+
+  it('turns sidebar aggregation off without touching the connection itself', async () => {
+    render(<RemoteConnectionsDialog reloadApp={vi.fn()} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Jean connections' }))
+
+    const toggle = screen.getByRole('switch', {
+      name: 'Show ses-temps sessions in the sidebar',
+    })
+    // Missing flag means aggregation is on.
+    expect(toggle).toBeChecked()
+
+    fireEvent.click(toggle)
+
+    await waitFor(() =>
+      expect(setConnectionAggregation).toHaveBeenCalledWith('conn-1', false)
+    )
+    // Flipping the toggle must not re-save the connection (which would
+    // require the token) nor switch to it.
+    expect(updateRemoteConnection).not.toHaveBeenCalled()
+    expect(selectConnection).not.toHaveBeenCalled()
+  })
+
+  it('reflects a stored opt-out and offers to turn it back on', async () => {
+    useRemoteConnections.mockReturnValue([
+      {
+        id: 'conn-1',
+        name: 'ses-temps',
+        url: 'https://jean.example.com',
+        aggregateSessions: false,
+      },
+    ])
+
+    render(<RemoteConnectionsDialog reloadApp={vi.fn()} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Jean connections' }))
+
+    const toggle = screen.getByRole('switch', {
+      name: 'Show ses-temps sessions in the sidebar',
+    })
+    expect(toggle).not.toBeChecked()
+
+    fireEvent.click(toggle)
+    await waitFor(() =>
+      expect(setConnectionAggregation).toHaveBeenCalledWith('conn-1', true)
+    )
+  })
+
+  it('hides the toggle in the native app, which has no satellite transports', () => {
+    isNativeApp.mockReturnValue(true)
+    render(<RemoteConnectionsDialog reloadApp={vi.fn()} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Jean connections' }))
+
+    expect(screen.queryByRole('switch')).not.toBeInTheDocument()
   })
 })
