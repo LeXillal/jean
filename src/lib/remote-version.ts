@@ -83,6 +83,17 @@ export function checkRemoteVersionCompatibility(
   }
 }
 
+/**
+ * True when a probe failure was the server rejecting the token, rather than the
+ * server being unreachable. Callers surface the two very differently, and the
+ * wording below is produced by `fetchRemoteServerInfo` itself — keep them
+ * together so the sniff cannot drift from the throw.
+ */
+export function isInvalidTokenError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return message.startsWith('Invalid access token')
+}
+
 export async function fetchRemoteServerInfo(
   url: string,
   token: string,
