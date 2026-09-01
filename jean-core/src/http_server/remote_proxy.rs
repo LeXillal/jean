@@ -146,6 +146,18 @@ pub(super) fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
+fn should_forward_request_header(name: &str) -> bool {
+    !is_hop_by_hop(name) && !name.eq_ignore_ascii_case("cookie")
+}
+
+fn should_forward_response_header(name: &str) -> bool {
+    !is_hop_by_hop(name)
+        && !matches!(
+            name.to_ascii_lowercase().as_str(),
+            "content-length" | "content-encoding" | "set-cookie"
+        )
+}
+
 fn is_loopback_host(host: &str) -> bool {
     matches!(
         host.to_ascii_lowercase().as_str(),
@@ -281,7 +293,7 @@ pub(super) async fn remote_http_proxy_handler(
     // own CompressionLayer is the only thing that (re)compresses.
     let mut forward_headers = HeaderMap::new();
     for (name, value) in headers.iter() {
-        if is_hop_by_hop(name.as_str()) {
+        if !should_forward_request_header(name.as_str()) {
             continue;
         }
         forward_headers.insert(name.clone(), value.clone());
@@ -311,8 +323,7 @@ pub(super) async fn remote_http_proxy_handler(
     // (f) Re-emit: upstream status + filtered headers, streamed body.
     let mut builder = Response::builder().status(upstream.status());
     for (name, value) in upstream.headers().iter() {
-        let lower = name.as_str().to_ascii_lowercase();
-        if is_hop_by_hop(&lower) || lower == "content-length" || lower == "content-encoding" {
+        if !should_forward_response_header(name.as_str()) {
             continue;
         }
         builder = builder.header(name, value);
@@ -588,6 +599,17 @@ mod tests {
         for header in ["content-type", "authorization", "accept", "x-custom"] {
             assert!(!is_hop_by_hop(header), "{header} should pass through");
         }
+    }
+
+    #[test]
+    fn hub_session_headers_are_not_forwarded() {
+        assert!(!should_forward_request_header("cookie"));
+        assert!(!should_forward_request_header("Cookie"));
+        assert!(should_forward_request_header("accept"));
+
+        assert!(!should_forward_response_header("set-cookie"));
+        assert!(!should_forward_response_header("Set-Cookie"));
+        assert!(should_forward_response_header("content-type"));
     }
 
     #[test]
