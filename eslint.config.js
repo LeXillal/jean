@@ -102,6 +102,9 @@ export default tseslint.config(
       'node_modules/**',
       'src-tauri/target/**',
       'src-tauri/gen/**',
+      // Git worktrees live here. Each is a full checkout, so linting them
+      // reports every finding once per worktree and buries the real ones.
+      '.claude/worktrees/**',
       'e2e/**',
       '*.config.js',
       '*.config.ts',
