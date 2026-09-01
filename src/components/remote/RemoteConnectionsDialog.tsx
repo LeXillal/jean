@@ -43,6 +43,7 @@ import {
   fetchRemoteServerInfo,
   formatJeanVersionLabel,
   getLocalJeanVersion,
+  isInvalidTokenError,
   warnRemoteVersionMismatch,
 } from '@/lib/remote-version'
 import { invoke, listenLocal } from '@/lib/transport'
@@ -80,6 +81,37 @@ type VersionState =
   | { status: 'loading' }
   | { status: 'ready'; version: string | null }
   | { status: 'error'; message: string }
+
+/**
+ * Whether a connection answered, and how it failed if it did not.
+ *
+ * This is the *reachability* of the server, not which connection is selected —
+ * the check mark next to the name carries that. The two used to share one green
+ * dot, so the probe result (already computed for the version column) was only
+ * ever visible as text.
+ */
+type Reachability = 'checking' | 'online' | 'offline' | 'auth-error'
+
+/** Same colour vocabulary as the sidebar's instance dots. */
+const REACHABILITY_DOT: Record<Reachability, string> = {
+  checking: 'bg-amber-500 animate-pulse',
+  online: 'bg-emerald-500',
+  offline: 'bg-muted-foreground/35',
+  'auth-error': 'bg-destructive',
+}
+
+const REACHABILITY_LABEL: Record<Reachability, string> = {
+  checking: 'Checking…',
+  online: 'Reachable',
+  offline: 'Unreachable',
+  'auth-error': 'Authentication failed',
+}
+
+function reachabilityOf(state: VersionState | undefined): Reachability {
+  if (!state || state.status === 'loading') return 'checking'
+  if (state.status === 'ready') return 'online'
+  return isInvalidTokenError(state.message) ? 'auth-error' : 'offline'
+}
 
 export function RemoteConnectionsDialog({
   reloadApp = () => window.location.reload(),
@@ -316,11 +348,8 @@ export function RemoteConnectionsDialog({
         } catch (probeError) {
           // Still allow save/connect; transport/recovery handles auth/network.
           // Surface probe failures only when we cannot normalize further.
-          if (
-            probeError instanceof Error &&
-            probeError.message.includes('Invalid access token')
-          ) {
-            setError(probeError.message)
+          if (isInvalidTokenError(probeError)) {
+            setError((probeError as Error).message)
             return
           }
         }
@@ -759,6 +788,9 @@ export function RemoteConnectionsDialog({
               name="Local"
               detail="This computer"
               versionLabel={formatJeanVersionLabel(localVersion)}
+              // Nothing to probe: this is the backend the client is already
+              // talking to, so it is reachable by the fact that the UI rendered.
+              reachability="online"
               active={activeId === LOCAL_CONNECTION_ID}
               connecting={connectingId === LOCAL_CONNECTION_ID}
               onSelect={() => void switchTo(LOCAL_CONNECTION_ID)}
@@ -769,12 +801,15 @@ export function RemoteConnectionsDialog({
                 versionState?.status === 'ready' &&
                 !checkRemoteVersionCompatibility(versionState.version)
                   .compatible
+              const reachability = reachabilityOf(versionState)
               const versionLabel =
                 versionState?.status === 'ready'
                   ? formatJeanVersionLabel(versionState.version)
-                  : versionState?.status === 'error'
-                    ? 'unreachable'
-                    : 'checking…'
+                  : reachability === 'checking'
+                    ? 'checking…'
+                    : reachability === 'auth-error'
+                      ? 'auth failed'
+                      : 'unreachable'
               return (
                 <ConnectionRow
                   key={connection.id}
@@ -782,6 +817,7 @@ export function RemoteConnectionsDialog({
                   detail={connection.url}
                   versionLabel={versionLabel}
                   versionWarning={mismatch}
+                  reachability={reachability}
                   active={activeId === connection.id}
                   connecting={connectingId === connection.id}
                   onSelect={() => void switchTo(connection.id)}
@@ -864,6 +900,7 @@ function ConnectionRow({
   detail,
   versionLabel,
   versionWarning,
+  reachability,
   active,
   connecting,
   onSelect,
@@ -874,6 +911,7 @@ function ConnectionRow({
   detail: string
   versionLabel: string
   versionWarning?: boolean
+  reachability: Reachability
   active: boolean
   connecting?: boolean
   onSelect: () => void
@@ -892,7 +930,13 @@ function ConnectionRow({
         disabled={connecting}
       >
         <span
-          className={`size-2 shrink-0 rounded-full ${active ? 'bg-green-500' : 'bg-muted-foreground/35'}`}
+          role="img"
+          aria-label={REACHABILITY_LABEL[reachability]}
+          title={REACHABILITY_LABEL[reachability]}
+          className={cn(
+            'size-2 shrink-0 rounded-full',
+            REACHABILITY_DOT[reachability]
+          )}
         />
         {name}
         {active && <Check className="size-3.5 shrink-0 text-green-500" />}
