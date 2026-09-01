@@ -38,10 +38,12 @@ vi.mock('@/lib/environment', () => ({
 }))
 
 import {
+  consumePendingNewSession,
   consumePendingSessionOpen,
   deriveSatelliteSessionStatus,
   instanceSessionKey,
   satelliteInstances,
+  setPendingNewSession,
   setPendingSessionOpen,
   useInstanceSessions,
   useSatelliteTransports,
@@ -182,6 +184,31 @@ describe('pending session open', () => {
 
     expect(consumePendingSessionOpen()).not.toBeNull()
     expect(consumePendingSessionOpen()).toBeNull()
+  })
+})
+
+describe('pending new session', () => {
+  beforeEach(() => {
+    window.sessionStorage.clear()
+  })
+
+  it('replays the request once its instance is in focus', () => {
+    setPendingNewSession('local')
+
+    expect(consumePendingNewSession()).toBe('local')
+  })
+
+  it('waits while the switch to another instance is still in flight', () => {
+    setPendingNewSession('some-other-server')
+
+    expect(consumePendingNewSession()).toBeNull()
+  })
+
+  it('consumes the request exactly once', () => {
+    setPendingNewSession('local')
+
+    expect(consumePendingNewSession()).toBe('local')
+    expect(consumePendingNewSession()).toBeNull()
   })
 })
 

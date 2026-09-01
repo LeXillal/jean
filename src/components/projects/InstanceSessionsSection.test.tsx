@@ -48,6 +48,7 @@ describe('InstanceSessionsSection', () => {
         instance={instance()}
         sessions={[makeInstanceSession()]}
         onOpenSession={vi.fn()}
+        onNewSession={vi.fn()}
       />
     )
 
@@ -65,6 +66,7 @@ describe('InstanceSessionsSection', () => {
         instance={instance()}
         sessions={[item]}
         onOpenSession={onOpenSession}
+        onNewSession={vi.fn()}
       />
     )
 
@@ -81,6 +83,7 @@ describe('InstanceSessionsSection', () => {
         instance={instance({ status: 'offline' })}
         sessions={[]}
         onOpenSession={vi.fn()}
+        onNewSession={vi.fn()}
       />
     )
 
@@ -96,6 +99,7 @@ describe('InstanceSessionsSection', () => {
         instance={instance({ status: 'auth-error' })}
         sessions={[makeInstanceSession()]}
         onOpenSession={vi.fn()}
+        onNewSession={vi.fn()}
       />
     )
 
@@ -109,6 +113,7 @@ describe('InstanceSessionsSection', () => {
         instance={instance()}
         sessions={[makeInstanceSession()]}
         onOpenSession={vi.fn()}
+        onNewSession={vi.fn()}
       />
     )
 
@@ -118,12 +123,69 @@ describe('InstanceSessionsSection', () => {
     expect(screen.queryByText('Fix the proxy')).not.toBeInTheDocument()
   })
 
+  it('offers a way in when the instance has no session', () => {
+    // Without this row an empty instance is only reachable from the connection
+    // picker: there is nothing else to click in its section.
+    const onNewSession = vi.fn()
+
+    render(
+      <InstanceSessionsSection
+        instance={instance()}
+        sessions={[]}
+        onOpenSession={vi.fn()}
+        onNewSession={onNewSession}
+      />
+    )
+
+    fireEvent.click(screen.getByText('New session'))
+
+    expect(onNewSession).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'a' })
+    )
+  })
+
+  it('starts a session from the header of a populated instance', () => {
+    const onNewSession = vi.fn()
+
+    render(
+      <InstanceSessionsSection
+        instance={instance()}
+        sessions={[makeInstanceSession()]}
+        onOpenSession={vi.fn()}
+        onNewSession={onNewSession}
+      />
+    )
+
+    fireEvent.click(screen.getByLabelText('New session on Server A'))
+
+    expect(onNewSession).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'a' })
+    )
+  })
+
+  it('offers no new session on an unreachable instance', () => {
+    render(
+      <InstanceSessionsSection
+        instance={instance({ status: 'offline' })}
+        sessions={[]}
+        onOpenSession={vi.fn()}
+        onNewSession={vi.fn()}
+      />
+    )
+
+    expect(
+      screen.queryByLabelText('New session on Server A')
+    ).not.toBeInTheDocument()
+    expect(screen.queryByText('New session')).not.toBeInTheDocument()
+  })
+
   it('marks an unread session', () => {
     render(
       <InstanceSessionsSection
         instance={instance()}
         sessions={[makeInstanceSession({ unread: true })]}
         onOpenSession={vi.fn()}
+        onNewSession={vi.fn()}
       />
     )
 
