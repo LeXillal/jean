@@ -1190,6 +1190,7 @@ dependencies = [
  "dirs",
  "flate2",
  "futures-util",
+ "hmac",
  "if-addrs",
  "ignore",
  "image",

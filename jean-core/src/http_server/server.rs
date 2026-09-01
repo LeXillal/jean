@@ -19,6 +19,7 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use super::assets;
 use super::auth;
+use super::login_guard;
 use super::websocket::handle_ws_connection;
 use super::EmitExt;
 use super::WsBroadcaster;
@@ -38,6 +39,12 @@ struct AppState {
     /// works while its `sid` is still listed here, which is what makes
     /// per-device revocation possible.
     sessions: Arc<std::sync::RwLock<auth::SessionStore>>,
+    /// Failed-login accounting for `/api/login`, per client address.
+    login_guard: Arc<login_guard::LoginGuard>,
+    /// Whether `X-Forwarded-For` may be believed when identifying a client.
+    /// Only true when the deployment declares a reverse proxy in front, since
+    /// the header is attacker-controlled otherwise.
+    trust_proxy: bool,
 }
 
 /// Server handle for shutdown coordination.
@@ -237,6 +244,12 @@ pub async fn start_server(
         dist_path: dist_path.clone(),
         session_key,
         sessions,
+        login_guard: Arc::new(login_guard::LoginGuard::new()),
+        // Opt-in: only the operator knows whether something in front rewrites
+        // the client address. Defaulting to true would let anyone spoof it.
+        trust_proxy: std::env::var("JEAN_TRUSTED_PROXY")
+            .map(|value| matches!(value.trim(), "1" | "true" | "yes"))
+            .unwrap_or(false),
     };
 
     let cors = cors_layer_from_env();
@@ -284,7 +297,11 @@ pub async fn start_server(
         log::info!(
             "HTTP server listening on {local_addr} (bind_host: {bind_host_for_log}, localhost_only: {localhost_only})"
         );
-        axum::serve(listener, router)
+        axum::serve(
+            listener,
+            // Needed so /api/login can bucket failures by client address.
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
             .with_graceful_shutdown(async {
                 let _ = shutdown_rx.await;
                 log::info!("HTTP server shutting down");
@@ -503,6 +520,7 @@ fn json_ok_with_cookie(cookie: String) -> Response {
 /// Exchange the raw token for an HttpOnly session cookie. Keeps the long-lived
 /// token out of the browser's localStorage and out of the WebSocket URL.
 async fn login_handler(
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     State(state): State<AppState>,
     Json(body): Json<LoginRequest>,
@@ -511,16 +529,55 @@ async fn login_handler(
     if !state.token_required {
         return Json(serde_json::json!({ "ok": true, "token_required": false })).into_response();
     }
+
+    let client = login_guard::client_ip(
+        Some(peer.ip()),
+        |name| headers.get(name).and_then(|value| value.to_str().ok()),
+        state.trust_proxy,
+    );
+
+    // Refuse a penalised client *before* comparing tokens. Checking anyway
+    // would make the penalty cosmetic: the attempt would still count.
+    if let Some(client) = client {
+        if let Some(remaining) = state.login_guard.blocked_for(client) {
+            log::warn!("Rejected /api/login from {client}: too many failed attempts");
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(
+                    axum::http::header::RETRY_AFTER,
+                    remaining.as_secs().max(1).to_string(),
+                )],
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "Too many failed attempts. Try again shortly.",
+                })),
+            )
+                .into_response();
+        }
+    }
+
     if !auth::validate_token(body.token.trim(), &state.token) {
-        // Gentle throttle: caps guessing to ~2/sec without a hard lockout (which
-        // a stranger could weaponize to lock the owner out). The 256-bit token
-        // is already infeasible to brute-force; this is defense in depth.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Penalise instead of sleeping: a sleep holds a task and a connection,
+        // so an attacker opening sockets in parallel pays nothing for it. The
+        // budget is per client, so a stranger being throttled can never lock
+        // the owner out of their own machine.
+        if let Some(client) = client {
+            if let Some(penalty) = state.login_guard.record_failure(client) {
+                log::warn!(
+                    "Failed /api/login from {client}: blocking further attempts for {}s",
+                    penalty.as_secs()
+                );
+            }
+        }
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "ok": false, "error": "Invalid token" })),
         )
             .into_response();
+    }
+
+    if let Some(client) = client {
+        state.login_guard.record_success(client);
     }
     let now = now_unix_secs();
     let (sid, expires_at) = {
