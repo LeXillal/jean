@@ -59,6 +59,44 @@ function fetchBackend(url: string): Promise<Response> {
   )
 }
 
+/**
+ * A hub token arriving in the page URL is exchanged for an HttpOnly session
+ * cookie exactly once per load; the reload that follows re-authenticates every
+ * transport from that cookie. Module-scoped so concurrent transports racing to
+ * connect do not each fire the exchange.
+ */
+let urlTokenCookieExchangeStarted = false
+
+/**
+ * Trade a hub token supplied in the URL for an HttpOnly session cookie, exactly
+ * like the sign-in form (see `handleWsAuthTokenSubmit`). This keeps the
+ * long-lived hub token out of localStorage (where any XSS could read it) and
+ * out of the WebSocket/auth query string. Web mode only — native builds have no
+ * same-origin cookie endpoint and keep the legacy localStorage token instead.
+ */
+async function exchangeHubUrlTokenForCookie(token: string): Promise<void> {
+  try {
+    const res = await fetch(`${window.location.origin}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ token }),
+    })
+    if (res.ok) {
+      // The cookie now carries auth; the token must not linger anywhere JS can
+      // read it back.
+      localStorage.removeItem('jean-http-token')
+      window.location.reload()
+      return
+    }
+  } catch {
+    // Older server without /api/login, or offline — fall through to the legacy
+    // token path so the client can still connect (or surface the auth error).
+  }
+  localStorage.setItem('jean-http-token', token)
+  window.location.reload()
+}
+
 // ---------------------------------------------------------------------------
 // File source URL conversion (drop-in for Tauri's convertFileSrc)
 // ---------------------------------------------------------------------------
@@ -579,14 +617,29 @@ class WsTransport {
     const token =
       remote?.token || urlToken || localStorage.getItem('jean-http-token') || ''
 
-    // Persist token from URL to localStorage for future page loads
+    // A hub token in the URL must not become a long-lived, XSS-readable
+    // localStorage entry (nor keep riding in the WS/auth query string).
     if (!remote && urlToken) {
-      localStorage.setItem('jean-http-token', urlToken)
-
-      // Remove token from URL for security (prevent history/bookmark exposure)
+      // Strip the token from the URL first (history/bookmark hygiene), so the
+      // post-exchange reload lands on a clean URL and cannot loop.
       const url = new URL(window.location.href)
       url.searchParams.delete('token')
       window.history.replaceState({}, '', url.toString())
+
+      if (!isNativeApp()) {
+        // Web: exchange the URL token for an HttpOnly session cookie, then let
+        // the reload re-authenticate from the cookie. Run once — the first
+        // transport to boot drives it for all of them.
+        if (!urlTokenCookieExchangeStarted) {
+          urlTokenCookieExchangeStarted = true
+          void exchangeHubUrlTokenForCookie(urlToken)
+        }
+        return
+      }
+
+      // Native builds have no same-origin cookie endpoint; keep the token in
+      // machine-local storage as before.
+      localStorage.setItem('jean-http-token', urlToken)
     }
 
     this._connecting = true

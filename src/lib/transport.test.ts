@@ -332,6 +332,44 @@ describe('transport bootstrap', () => {
     expect(tauriInvoke).not.toHaveBeenCalled()
   })
 
+  it('trades a hub token in the URL for a cookie instead of persisting it', async () => {
+    const reload = vi.fn()
+    vi.stubGlobal('location', {
+      href: 'https://jean.example.com/?token=hub-secret',
+      search: '?token=hub-secret',
+      origin: 'https://jean.example.com',
+      reload,
+    })
+    const replaceState = vi
+      .spyOn(window.history, 'replaceState')
+      .mockImplementation(() => undefined)
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue({ ok: true, json: async () => ({}) })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const transport = await loadTransportModule()
+    transport.connectTransport()
+    await flushAsync()
+
+    // The hub token is exchanged for an HttpOnly cookie via /api/login…
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://jean.example.com/api/login',
+      expect.objectContaining({ method: 'POST', credentials: 'same-origin' })
+    )
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
+      token: 'hub-secret',
+    })
+
+    // …never left in localStorage (XSS-readable) and never opened as a
+    // token-bearing WebSocket. The reload re-authenticates from the cookie.
+    expect(localStorage.getItem('jean-http-token')).toBeNull()
+    expect(MockWebSocket.instances).toHaveLength(0)
+    expect(reload).toHaveBeenCalled()
+
+    replaceState.mockRestore()
+  })
+
   it('does not open websocket until bootstrap explicitly connects it', async () => {
     const transport = await loadTransportModule()
 
