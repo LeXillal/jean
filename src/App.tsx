@@ -12,6 +12,7 @@ import {
   invoke,
   useWsConnectionStatus,
   useWsAuthError,
+  useWsAuthReason,
   preloadInitialData,
   setAppDataDir,
   hasPreloadedData,
@@ -102,6 +103,7 @@ import { peekWebReloadState, saveWebReloadState } from './lib/web-reload-state'
 import {
   clearConnectionSwitch,
   getActiveRemoteConnection,
+  initRemoteConnections,
   isConnectionSwitchPending,
 } from './lib/remote-connections'
 import { RemoteConnectionRecovery } from './components/remote/RemoteConnectionRecovery'
@@ -116,14 +118,35 @@ interface AutoFixStoppedEvent {
   error: string
 }
 
-function handleWsAuthTokenSubmit(token: string) {
+async function handleWsAuthTokenSubmit(token: string) {
+  // Prefer exchanging the token for an HttpOnly session cookie: it keeps the
+  // long-lived token out of localStorage and out of the WebSocket URL. The
+  // cookie is same-origin, so the browser sends it automatically afterwards.
+  try {
+    const res = await fetch(`${window.location.origin}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ token }),
+    })
+    if (res.ok) {
+      localStorage.removeItem('jean-http-token')
+      window.location.reload()
+      return
+    }
+  } catch {
+    // Endpoint missing (older server) or network error → legacy token path.
+  }
+  // Fallback: store the token so validateAndConnect re-checks it and surfaces
+  // the correct error (or connects, on an older server without /api/login).
   localStorage.setItem('jean-http-token', token)
   window.location.reload()
 }
 
-/** Full-screen auth error overlay for web access mode. */
+/** Sign-in surface for web access mode, shown until the session is authorized. */
 function WsAuthErrorOverlay() {
   const authError = useWsAuthError()
+  const authReason = useWsAuthReason()
   const remote = getActiveRemoteConnection()
 
   if (!authError) return null
@@ -133,9 +156,13 @@ function WsAuthErrorOverlay() {
   }
 
   return (
-    <div className="fixed inset-0 z-[80] flex items-center justify-center bg-background/90">
+    <div className="fixed inset-0 z-[80] flex items-center justify-center bg-background">
       <WebAccessAuthScreen
         authError={authError}
+        // 'unreachable' only arises on remote paths; if one slips through
+        // (remote removed right after a drop), the sign-in form still works —
+        // submitting reloads the page, which is how connections recover.
+        reason={authReason === 'rejected' ? 'rejected' : 'signed-out'}
         onTokenSubmit={handleWsAuthTokenSubmit}
       />
     </div>
@@ -738,31 +765,35 @@ function App() {
   useEffect(() => {
     if (!webBackend) return
 
-    if (!hasStartedTransportRef.current) {
-      hasStartedTransportRef.current = true
-      connectTransport()
-    }
+    // The active remote's URL and token live on the origin server in web
+    // mode; resolve the connection list before opening any transport.
+    void initRemoteConnections().then(() => {
+      if (!hasStartedTransportRef.current) {
+        hasStartedTransportRef.current = true
+        connectTransport()
+      }
 
-    const initialSelectedProjectId =
-      peekWebReloadState()?.projectId ??
-      useProjectsStore.getState().selectedProjectId
-    preloadInitialData(initialSelectedProjectId)
-      .then(data => {
-        if (data) {
-          logger.info('Preloaded initial data via HTTP', {
-            projects: Array.isArray(data.projects) ? data.projects.length : 0,
-          })
-          checkWebClientVersion(data)
-          seedCache(data)
-          ingestBootstrapEvents(data.replayEvents ?? [])
-        }
-      })
-      .catch(err => {
-        logger.warn('Failed to preload initial data', { error: err })
-      })
-      .finally(() => {
-        setIsPreloading(false)
-      })
+      const initialSelectedProjectId =
+        peekWebReloadState()?.projectId ??
+        useProjectsStore.getState().selectedProjectId
+      preloadInitialData(initialSelectedProjectId)
+        .then(data => {
+          if (data) {
+            logger.info('Preloaded initial data via HTTP', {
+              projects: Array.isArray(data.projects) ? data.projects.length : 0,
+            })
+            checkWebClientVersion(data)
+            seedCache(data)
+            ingestBootstrapEvents(data.replayEvents ?? [])
+          }
+        })
+        .catch(err => {
+          logger.warn('Failed to preload initial data', { error: err })
+        })
+        .finally(() => {
+          setIsPreloading(false)
+        })
+    })
   }, [queryClient, seedCache, webBackend])
 
   // Global safety net for uncaught async errors / promise rejections.
@@ -1635,6 +1666,14 @@ function App() {
   // on WS when preload failed and we have nothing to show.
   const blockOnWs =
     webBackend && !wsConnected && !wsAuthError && !hasPreloadedData()
+
+  // A browser session that has not authenticated yet has nothing to show
+  // behind the sign-in prompt. Render it alone instead of booting the whole
+  // app underneath and covering it with an overlay. Native remote clients keep
+  // the overlay: their local UI stays usable while a remote is unreachable.
+  if (webBackend && wsAuthError && !getActiveRemoteConnection()) {
+    return <WsAuthErrorOverlay />
+  }
 
   if (isPreloading || blockOnWs) {
     return (

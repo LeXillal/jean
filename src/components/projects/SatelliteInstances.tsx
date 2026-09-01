@@ -1,0 +1,125 @@
+import { useCallback, useEffect, useMemo } from 'react'
+import {
+  markConnectionSwitch,
+  selectConnection,
+} from '@/lib/remote-connections'
+import { isNativeApp } from '@/lib/environment'
+import {
+  consumePendingSessionOpen,
+  setPendingSessionOpen,
+  satelliteInstances,
+  useInstanceSessions,
+  useInstances,
+  useSatelliteSessionRefresh,
+  useSatelliteTransports,
+  type InstanceSession,
+} from '@/services/instances'
+import { useChatStore } from '@/store/chat-store'
+import { useProjectsStore } from '@/store/projects-store'
+import { InstanceSessionsSection } from './InstanceSessionsSection'
+
+/**
+ * Replay a session open that was requested on another instance before the
+ * connection switch reloaded the page.
+ *
+ * Mirrors `WorktreeItem`'s own select-then-open sequence, including the short
+ * delay that lets the canvas mount its `open-session-modal` listener.
+ */
+function usePendingSessionOpen(ready: boolean): void {
+  useEffect(() => {
+    if (!ready) return
+    const pending = consumePendingSessionOpen()
+    if (!pending) return
+
+    useProjectsStore.getState().selectProject(pending.projectId)
+    useProjectsStore.getState().selectWorktree(pending.worktreeId)
+    useChatStore.getState().clearActiveWorktree()
+    useChatStore
+      .getState()
+      .setActiveSession(pending.worktreeId, pending.sessionId)
+
+    const timer = setTimeout(() => {
+      window.dispatchEvent(
+        new CustomEvent('open-session-modal', {
+          detail: {
+            sessionId: pending.sessionId,
+            worktreeId: pending.worktreeId,
+            worktreePath: pending.worktreePath,
+          },
+        })
+      )
+    }, 50)
+    return () => clearTimeout(timer)
+  }, [ready])
+}
+
+interface SatelliteInstancesProps {
+  /** True once the focused instance's own projects have loaded. */
+  ready: boolean
+}
+
+/**
+ * Sessions from every Jean instance that is NOT the focused one and has sidebar
+ * aggregation enabled, grouped under a header per instance.
+ *
+ * The focused instance keeps its full project tree above; these sections are
+ * the aggregated half of the sidebar. Native desktop is excluded: it has no
+ * hub to relay background connections through.
+ */
+export function SatelliteInstances({ ready }: SatelliteInstancesProps) {
+  const instances = useInstances()
+  // Empty on native so the fan-out below issues no queries at all: `invokeOn`
+  // would otherwise build a WebSocket transport per registered remote that can
+  // never connect, leaking its wake listeners and hanging on the command
+  // timeout — all for a component that renders null here.
+  const satellites = useMemo(
+    () => (isNativeApp() ? [] : satelliteInstances(instances)),
+    [instances]
+  )
+
+  useSatelliteTransports(instances)
+  useSatelliteSessionRefresh(instances)
+  usePendingSessionOpen(ready)
+
+  const sessions = useInstanceSessions(satellites)
+
+  const sessionsByInstance = useMemo(() => {
+    const grouped = new Map<string, InstanceSession[]>()
+    for (const item of sessions) {
+      const bucket = grouped.get(item.instanceId)
+      if (bucket) bucket.push(item)
+      else grouped.set(item.instanceId, [item])
+    }
+    return grouped
+  }, [sessions])
+
+  const handleOpenSession = useCallback((item: InstanceSession) => {
+    // The target lives on another server: record it, then switch. The reload
+    // is the existing switch flow; `usePendingSessionOpen` finishes the job.
+    setPendingSessionOpen({
+      instanceId: item.instanceId,
+      projectId: item.projectId,
+      worktreeId: item.worktreeId,
+      worktreePath: item.worktreePath,
+      sessionId: item.session.id,
+    })
+    markConnectionSwitch()
+    selectConnection(item.instanceId)
+    window.location.reload()
+  }, [])
+
+  if (isNativeApp() || satellites.length === 0) return null
+
+  return (
+    <div className="border-t border-border/50 pt-1">
+      {satellites.map(instance => (
+        <InstanceSessionsSection
+          key={instance.id}
+          instance={instance}
+          sessions={sessionsByInstance.get(instance.id) ?? []}
+          onOpenSession={handleOpenSession}
+        />
+      ))}
+    </div>
+  )
+}

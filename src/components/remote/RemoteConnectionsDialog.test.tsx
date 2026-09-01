@@ -6,16 +6,24 @@ const {
   addRemoteConnection,
   selectConnection,
   fetchRemoteServerInfo,
+  probeConnectionServerInfo,
   getLocalJeanVersion,
   warnRemoteVersionMismatch,
   invoke,
   isNativeApp,
   listenLocal,
+  updateRemoteConnection,
   useRemoteConnections,
+  setConnectionAggregation,
 } = vi.hoisted(() => ({
   addRemoteConnection: vi.fn(() => ({ id: 'remote-1' })),
   selectConnection: vi.fn(),
   fetchRemoteServerInfo: vi.fn(async () => ({
+    ok: true,
+    appVersion: '0.1.69',
+    webBuildId: '0.1.69-test',
+  })),
+  probeConnectionServerInfo: vi.fn(async () => ({
     ok: true,
     appVersion: '0.1.69',
     webBuildId: '0.1.69-test',
@@ -27,7 +35,9 @@ const {
   listenLocal: vi.fn(async () => () => {
     // no-op unsubscribe
   }),
-  useRemoteConnections: vi.fn((): unknown[] => []),
+  updateRemoteConnection: vi.fn(async () => ({ id: 'remote-1' })),
+  useRemoteConnections: vi.fn(() => [] as unknown[]),
+  setConnectionAggregation: vi.fn(async () => undefined),
 }))
 
 vi.mock('@/lib/remote-connections', () => ({
@@ -56,8 +66,11 @@ vi.mock('@/lib/remote-connections', () => ({
     }
   },
   selectConnection,
-  updateRemoteConnection: vi.fn(),
-  useRemoteConnections: () => useRemoteConnections(),
+  setConnectionAggregation,
+  updateRemoteConnection,
+  useRemoteConnections,
+  aggregatesSessions: (connection: { aggregateSessions?: boolean }) =>
+    connection.aggregateSessions !== false,
 }))
 
 vi.mock('@/lib/remote-version', () => ({
@@ -87,6 +100,7 @@ vi.mock('@/lib/environment', () => ({
 vi.mock('@/lib/transport', () => ({
   invoke,
   listenLocal,
+  probeConnectionServerInfo,
 }))
 
 describe('RemoteConnectionsDialog', () => {
@@ -97,12 +111,19 @@ describe('RemoteConnectionsDialog', () => {
       appVersion: '0.1.69',
       webBuildId: '0.1.69-test',
     })
+    probeConnectionServerInfo.mockResolvedValue({
+      ok: true,
+      appVersion: '0.1.69',
+      webBuildId: '0.1.69-test',
+    })
     warnRemoteVersionMismatch.mockReturnValue(false)
     isNativeApp.mockReturnValue(false)
+    addRemoteConnection.mockReturnValue({ id: 'remote-1' })
+    updateRemoteConnection.mockResolvedValue({ id: 'remote-1' })
     useRemoteConnections.mockReturnValue([])
   })
 
-  it('adds and selects a remote from a complete Web Access URL', async () => {
+  it('adds and selects a remote from a complete Web Access URL without probing it directly (web proxy)', async () => {
     const reloadApp = vi.fn()
     render(<RemoteConnectionsDialog reloadApp={reloadApp} />)
 
@@ -117,10 +138,6 @@ describe('RemoteConnectionsDialog', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save & Connect' }))
 
     await waitFor(() => {
-      expect(fetchRemoteServerInfo).toHaveBeenCalledWith(
-        'https://jean.example.com',
-        'secret'
-      )
       expect(addRemoteConnection).toHaveBeenCalledWith({
         name: 'Build server',
         url: 'https://jean.example.com/?token=secret',
@@ -132,9 +149,14 @@ describe('RemoteConnectionsDialog', () => {
       expect(selectConnection).toHaveBeenCalledWith('remote-1')
       expect(reloadApp).toHaveBeenCalled()
     })
+    // Web clients never hit the remote directly; the browser holds no remote
+    // token and there is no id yet to relay through the proxy.
+    expect(fetchRemoteServerInfo).not.toHaveBeenCalled()
+    expect(probeConnectionServerInfo).not.toHaveBeenCalled()
   })
 
-  it('shows local version and still connects when remote mismatches', async () => {
+  it('probes the remote and still connects on mismatch when adding in the native app', async () => {
+    isNativeApp.mockReturnValue(true)
     fetchRemoteServerInfo.mockResolvedValueOnce({
       ok: true,
       appVersion: '0.2.0',
@@ -149,16 +171,49 @@ describe('RemoteConnectionsDialog', () => {
     expect(screen.getByText('v0.1.69')).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: 'Add remote' }))
+    // Native add defaults to the SSH install tab; switch to the URL tab.
+    fireEvent.click(screen.getByRole('tab', { name: /Existing URL/i }))
     fireEvent.change(screen.getByLabelText('Web Access URL'), {
       target: { value: 'https://jean.example.com/?token=secret' },
     })
     fireEvent.click(screen.getByRole('button', { name: 'Save & Connect' }))
 
     await waitFor(() => {
+      expect(fetchRemoteServerInfo).toHaveBeenCalledWith(
+        'https://jean.example.com',
+        'secret'
+      )
       expect(warnRemoteVersionMismatch).toHaveBeenCalledWith('0.2.0')
       expect(addRemoteConnection).toHaveBeenCalled()
       expect(selectConnection).toHaveBeenCalledWith('remote-1')
       expect(reloadApp).toHaveBeenCalled()
+    })
+  })
+
+  it('does not pre-fill the saved token when editing and keeps it blank in the PUT (web)', async () => {
+    useRemoteConnections.mockReturnValue([
+      {
+        id: 'conn-1',
+        name: 'ses-temps',
+        url: 'https://jean.example.com',
+      },
+    ])
+
+    render(<RemoteConnectionsDialog reloadApp={vi.fn()} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Jean connections' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Edit ses-temps' }))
+
+    // The write-only token field must never be pre-filled with a saved token.
+    expect(screen.getByLabelText('Access token')).toHaveValue('')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => {
+      expect(updateRemoteConnection).toHaveBeenCalledWith(
+        'conn-1',
+        expect.objectContaining({ token: '' })
+      )
     })
   })
 
@@ -257,72 +312,6 @@ describe('RemoteConnectionsDialog', () => {
     })
   })
 
-  describe('connection status dot', () => {
-    const remote = {
-      id: 'remote-1',
-      name: 'Build server',
-      url: 'https://jean.example.com',
-      token: 'secret',
-    }
-
-    const openDialog = () => {
-      render(<RemoteConnectionsDialog reloadApp={vi.fn()} />)
-      fireEvent.click(screen.getByRole('button', { name: 'Jean connections' }))
-    }
-
-    it('reports a reachable remote as reachable, not merely selected', async () => {
-      useRemoteConnections.mockReturnValue([remote])
-      openDialog()
-
-      // 'local' is the active connection here, so a green dot on the remote can
-      // only mean the probe answered.
-      await waitFor(() => {
-        expect(screen.getByRole('img', { name: 'Reachable' })).toHaveClass(
-          'bg-emerald-500'
-        )
-      })
-    })
-
-    it('distinguishes an unreachable remote from a rejected token', async () => {
-      useRemoteConnections.mockReturnValue([remote])
-      fetchRemoteServerInfo.mockRejectedValue(
-        new Error('Timed out reaching the Jean server.')
-      )
-      openDialog()
-
-      await waitFor(() => {
-        expect(screen.getByRole('img', { name: 'Unreachable' })).toHaveClass(
-          'bg-muted-foreground/35'
-        )
-      })
-      expect(screen.getByText('unreachable')).toBeInTheDocument()
-    })
-
-    it('flags a rejected token as an auth failure', async () => {
-      useRemoteConnections.mockReturnValue([remote])
-      fetchRemoteServerInfo.mockRejectedValue(
-        new Error('Invalid access token for this Jean server.')
-      )
-      openDialog()
-
-      await waitFor(() => {
-        expect(
-          screen.getByRole('img', { name: 'Authentication failed' })
-        ).toHaveClass('bg-destructive')
-      })
-      // The old label sent the user debugging the network for a token problem.
-      expect(screen.getByText('auth failed')).toBeInTheDocument()
-      expect(screen.queryByText('unreachable')).not.toBeInTheDocument()
-    })
-
-    it('shows Local as reachable without probing it', () => {
-      openDialog()
-
-      expect(screen.getByRole('img', { name: 'Reachable' })).toBeInTheDocument()
-      expect(fetchRemoteServerInfo).not.toHaveBeenCalled()
-    })
-  })
-
   it('can switch from install mode to existing URL mode', () => {
     isNativeApp.mockReturnValue(true)
     render(<RemoteConnectionsDialog reloadApp={vi.fn()} />)
@@ -335,5 +324,139 @@ describe('RemoteConnectionsDialog', () => {
     expect(
       screen.getByRole('button', { name: 'Save & Connect' })
     ).toBeInTheDocument()
+  })
+})
+
+describe('RemoteConnectionsDialog sidebar toggle', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    isNativeApp.mockReturnValue(false)
+    useRemoteConnections.mockReturnValue([
+      { id: 'conn-1', name: 'ses-temps', url: 'https://jean.example.com' },
+    ])
+  })
+
+  it('turns sidebar aggregation off without touching the connection itself', async () => {
+    render(<RemoteConnectionsDialog reloadApp={vi.fn()} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Jean connections' }))
+
+    const toggle = screen.getByRole('switch', {
+      name: 'Show ses-temps sessions in the sidebar',
+    })
+    // Missing flag means aggregation is on.
+    expect(toggle).toBeChecked()
+
+    fireEvent.click(toggle)
+
+    await waitFor(() =>
+      expect(setConnectionAggregation).toHaveBeenCalledWith('conn-1', false)
+    )
+    // Flipping the toggle must not re-save the connection (which would
+    // require the token) nor switch to it.
+    expect(updateRemoteConnection).not.toHaveBeenCalled()
+    expect(selectConnection).not.toHaveBeenCalled()
+  })
+
+  it('reflects a stored opt-out and offers to turn it back on', async () => {
+    useRemoteConnections.mockReturnValue([
+      {
+        id: 'conn-1',
+        name: 'ses-temps',
+        url: 'https://jean.example.com',
+        aggregateSessions: false,
+      },
+    ])
+
+    render(<RemoteConnectionsDialog reloadApp={vi.fn()} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Jean connections' }))
+
+    const toggle = screen.getByRole('switch', {
+      name: 'Show ses-temps sessions in the sidebar',
+    })
+    expect(toggle).not.toBeChecked()
+
+    fireEvent.click(toggle)
+    await waitFor(() =>
+      expect(setConnectionAggregation).toHaveBeenCalledWith('conn-1', true)
+    )
+  })
+
+  it('hides the toggle in the native app, which has no satellite transports', () => {
+    isNativeApp.mockReturnValue(true)
+    render(<RemoteConnectionsDialog reloadApp={vi.fn()} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Jean connections' }))
+
+    expect(screen.queryByRole('switch')).not.toBeInTheDocument()
+  })
+})
+
+describe('RemoteConnectionsDialog status dot', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    isNativeApp.mockReturnValue(false)
+    getLocalJeanVersion.mockReturnValue('0.1.69')
+    probeConnectionServerInfo.mockResolvedValue({
+      ok: true,
+      appVersion: '0.1.69',
+      webBuildId: '0.1.69-test',
+    })
+    useRemoteConnections.mockReturnValue([
+      { id: 'conn-1', name: 'Build server', url: 'https://jean.example.com' },
+    ])
+  })
+
+  const openDialog = () => {
+    render(<RemoteConnectionsDialog reloadApp={vi.fn()} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Jean connections' }))
+    // Local carries a dot too and always renders first, so a global query
+    // would happily assert on the wrong row.
+    return () => {
+      const [, remote] = screen.getAllByRole('img')
+      return remote as HTMLElement
+    }
+  }
+
+  it('reports a reachable remote as reachable, not merely selected', async () => {
+    const row = openDialog()
+
+    // 'local' is the active connection here, so a green dot on the remote can
+    // only mean the probe answered.
+    await waitFor(() => expect(row()).toHaveAccessibleName('Reachable'))
+    expect(row()).toHaveClass('bg-emerald-500')
+  })
+
+  it('greys out a remote that never answered', async () => {
+    probeConnectionServerInfo.mockRejectedValue(
+      new Error('Timed out reaching the Jean server.')
+    )
+    const row = openDialog()
+
+    await waitFor(() => expect(row()).toHaveAccessibleName('Unreachable'))
+    expect(row()).toHaveClass('bg-muted-foreground/35')
+    expect(screen.getByText('unreachable')).toBeInTheDocument()
+  })
+
+  it('flags a rejected token as an auth failure, not as unreachable', async () => {
+    probeConnectionServerInfo.mockRejectedValue(
+      new Error('Invalid access token for this Jean server.')
+    )
+    const row = openDialog()
+
+    await waitFor(() =>
+      expect(row()).toHaveAccessibleName('Authentication failed')
+    )
+    expect(row()).toHaveClass('bg-destructive')
+    // The old label sent the user debugging the network for a token problem.
+    expect(screen.getByText('auth failed')).toBeInTheDocument()
+    expect(screen.queryByText('unreachable')).not.toBeInTheDocument()
+  })
+
+  it('shows Local as reachable without probing it', () => {
+    useRemoteConnections.mockReturnValue([])
+    render(<RemoteConnectionsDialog reloadApp={vi.fn()} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Jean connections' }))
+
+    expect(screen.getByRole('img')).toHaveAccessibleName('Reachable')
+    expect(probeConnectionServerInfo).not.toHaveBeenCalled()
   })
 })

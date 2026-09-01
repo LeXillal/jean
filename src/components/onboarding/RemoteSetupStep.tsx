@@ -99,23 +99,28 @@ export function RemoteSetupStep({
       }
       const normalized = parseRemoteConnectionInput(input.url, input.token)
 
-      try {
-        const info = await fetchRemoteServerInfo(
-          normalized.url,
-          normalized.token
-        )
-        warnRemoteVersionMismatch(info.appVersion)
-      } catch (probeError) {
-        if (
-          probeError instanceof Error &&
-          probeError.message.includes('Invalid access token')
-        ) {
-          setError(probeError.message)
-          return
+      // Web clients cannot probe an unregistered remote (no id to proxy through,
+      // and the browser holds no remote token); the token is validated when the
+      // proxy connects. Native keeps the direct probe.
+      if (native) {
+        try {
+          const info = await fetchRemoteServerInfo(
+            normalized.url,
+            normalized.token
+          )
+          warnRemoteVersionMismatch(info.appVersion)
+        } catch (probeError) {
+          if (
+            probeError instanceof Error &&
+            probeError.message.includes('Invalid access token')
+          ) {
+            setError(probeError.message)
+            return
+          }
         }
       }
 
-      const connection = addRemoteConnection(input)
+      const connection = await addRemoteConnection(input)
       markConnectionSwitch()
       selectConnection(connection.id)
       reloadApp()
@@ -177,7 +182,7 @@ export function RemoteSetupStep({
         throw new Error('Remote jean-server did not report ready.')
       }
 
-      const connection = addRemoteConnection({
+      const connection = await addRemoteConnection({
         name: result.name,
         url: result.url,
         token: result.token,

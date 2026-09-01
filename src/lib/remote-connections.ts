@@ -1,4 +1,7 @@
 import { useSyncExternalStore } from 'react'
+// Circular import with environment.ts (it re-exports nothing from here at
+// module scope); isNativeApp is only called after both modules evaluate.
+import { isNativeApp } from './environment'
 import { generateId } from './uuid'
 
 export const LOCAL_CONNECTION_ID = 'local'
@@ -11,22 +14,42 @@ export interface RemoteConnection {
   id: string
   name: string
   url: string
-  token: string
+  /**
+   * Access token. Optional: web clients load the list from the origin hub,
+   * which masks tokens (write-only field). Native clients keep the real token
+   * in their machine-local storage.
+   */
+  token?: string
   /** SSH user for local editors that open remote paths (Zed `ssh://`). */
   sshUser?: string
   /** SSH host/IP; falls back to Web Access URL hostname when omitted. */
   sshHost?: string
   /** SSH port (default 22 when omitted). */
   sshPort?: number
+  /**
+   * Aggregate this instance's sessions into the sidebar. Omitted means `true`:
+   * connections created before the toggle existed keep aggregating.
+   * When `false` the instance is switch-only — no background transport, no
+   * sidebar section.
+   */
+  aggregateSessions?: boolean
 }
 
 export interface RemoteConnectionInput {
   name: string
   url: string
-  token: string
+  /** Only sent when (re)entered; empty/omitted keeps the stored token. */
+  token?: string
   sshUser?: string
   sshHost?: string
   sshPort?: number
+  /** Omitted keeps the stored value (or the `true` default for a new one). */
+  aggregateSessions?: boolean
+}
+
+/** Whether this instance's sessions show up in the sidebar. Missing = on. */
+export function aggregatesSessions(connection: RemoteConnection): boolean {
+  return connection.aggregateSessions !== false
 }
 
 /** Parse a user-entered SSH port string; empty → undefined. Throws on invalid. */
@@ -42,15 +65,15 @@ export function parseOptionalSshPort(raw: string): number | undefined {
 
 const subscribers = new Set<() => void>()
 let connectionsSnapshot: RemoteConnection[] = readConnections()
-const savedActiveConnection =
-  storage()?.getItem(ACTIVE_CONNECTION_KEY) || LOCAL_CONNECTION_ID
+// Raw saved selection. Validation against the list is deferred to
+// getActiveConnectionId() because in web mode the list arrives
+// asynchronously from the server (initRemoteConnections).
 let activeConnectionSnapshot =
-  savedActiveConnection === LOCAL_CONNECTION_ID ||
-  connectionsSnapshot.some(
-    connection => connection.id === savedActiveConnection
-  )
-    ? savedActiveConnection
-    : LOCAL_CONNECTION_ID
+  storage()?.getItem(ACTIVE_CONNECTION_KEY) || LOCAL_CONNECTION_ID
+
+function notifySubscribers(): void {
+  for (const subscriber of subscribers) subscriber()
+}
 
 function storage(): Storage | null {
   return typeof window === 'undefined' ? null : window.localStorage
@@ -74,8 +97,7 @@ function normalizeConnection(item: unknown): RemoteConnection | null {
   if (
     typeof record.id !== 'string' ||
     typeof record.name !== 'string' ||
-    typeof record.url !== 'string' ||
-    typeof record.token !== 'string'
+    typeof record.url !== 'string'
   ) {
     return null
   }
@@ -84,7 +106,11 @@ function normalizeConnection(item: unknown): RemoteConnection | null {
     id: record.id,
     name: record.name,
     url: record.url,
-    token: record.token,
+  }
+
+  // Token is optional: the origin hub masks it in GET responses (write-only).
+  if (typeof record.token === 'string' && record.token) {
+    connection.token = record.token
   }
 
   const sshUser = normalizeOptionalString(record.sshUser)
@@ -93,6 +119,8 @@ function normalizeConnection(item: unknown): RemoteConnection | null {
   if (sshUser) connection.sshUser = sshUser
   if (sshHost) connection.sshHost = sshHost
   if (sshPort) connection.sshPort = sshPort
+  // Only the explicit opt-out is kept; anything else falls back to the default.
+  if (record.aggregateSessions === false) connection.aggregateSessions = false
 
   return connection
 }
@@ -132,15 +160,91 @@ function sshFieldsFromInput(input: RemoteConnectionInput): {
   return fields
 }
 
-function writeConnections(connections: RemoteConnection[]): void {
+/** Web clients store the list on the origin Jean server so every device
+ * shares one configuration and remote tokens never persist in the browser.
+ * Native apps keep localStorage (their WebView storage is machine-local). */
+function usesServerConnectionStore(): boolean {
+  if (typeof window === 'undefined' || isNativeApp()) return false
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return !(window as any).__JEAN_E2E_MOCK__
+}
+
+function serverConnectionsUrl(): string {
+  const urlToken = new URLSearchParams(window.location.search).get('token')
+  const token = urlToken || storage()?.getItem('jean-http-token') || ''
+  const params = token ? `?token=${encodeURIComponent(token)}` : ''
+  return `${window.location.origin}/api/remote-connections${params}`
+}
+
+async function pushServerConnections(
+  connections: RemoteConnection[]
+): Promise<void> {
+  const response = await fetch(serverConnectionsUrl(), {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(connections),
+  })
+  if (!response.ok) {
+    throw new Error('Failed to save connections to the Jean server.')
+  }
+}
+
+function commitConnections(connections: RemoteConnection[]): void {
   connectionsSnapshot = connections
+  notifySubscribers()
+}
+
+async function persistConnections(
+  connections: RemoteConnection[]
+): Promise<void> {
+  if (usesServerConnectionStore()) {
+    // Server write must complete before commit: callers reload the page
+    // right after, which would abort an in-flight PUT.
+    await pushServerConnections(connections)
+    commitConnections(connections)
+    return
+  }
   storage()?.setItem(CONNECTIONS_KEY, JSON.stringify(connections))
-  for (const subscriber of subscribers) subscriber()
+  commitConnections(connections)
+}
+
+let initPromise: Promise<void> | null = null
+
+/**
+ * Load the connection list from the origin Jean server (web mode only).
+ * Must resolve before the transport connects: the active remote's URL and
+ * token come from this list. A pre-server-store localStorage list is
+ * migrated up once, then removed from the browser.
+ */
+export function initRemoteConnections(): Promise<void> {
+  if (!usesServerConnectionStore()) return Promise.resolve()
+  initPromise ??= (async () => {
+    try {
+      const response = await fetch(serverConnectionsUrl())
+      // Unauthenticated or older server: keep the localStorage fallback.
+      if (!response.ok) return
+      const parsed: unknown = await response.json()
+      const serverList = (Array.isArray(parsed) ? parsed : [])
+        .map(normalizeConnection)
+        .filter((item): item is RemoteConnection => item !== null)
+
+      const legacy = readConnections().filter(
+        item => !serverList.some(existing => existing.id === item.id)
+      )
+      const merged = [...serverList, ...legacy]
+      if (legacy.length > 0) await pushServerConnections(merged)
+      storage()?.removeItem(CONNECTIONS_KEY)
+      commitConnections(merged)
+    } catch {
+      // Server unreachable: keep whatever localStorage had.
+    }
+  })()
+  return initPromise
 }
 
 export function parseRemoteConnectionInput(
   rawUrl: string,
-  rawToken: string
+  rawToken?: string
 ): { url: string; token: string } {
   let parsed: URL
   try {
@@ -154,7 +258,7 @@ export function parseRemoteConnectionInput(
   }
 
   const token =
-    rawToken.trim() || parsed.searchParams.get('token')?.trim() || ''
+    rawToken?.trim() || parsed.searchParams.get('token')?.trim() || ''
   parsed.search = ''
   parsed.hash = ''
   parsed.pathname = parsed.pathname.replace(/\/+$/, '')
@@ -166,50 +270,95 @@ export function getRemoteConnections(): RemoteConnection[] {
   return connectionsSnapshot
 }
 
-export function addRemoteConnection(
+export async function addRemoteConnection(
   input: RemoteConnectionInput
-): RemoteConnection {
+): Promise<RemoteConnection> {
   const normalized = parseRemoteConnectionInput(input.url, input.token)
   const connection: RemoteConnection = {
     id: generateId(),
     name: input.name.trim() || new URL(normalized.url).hostname,
-    ...normalized,
+    url: normalized.url,
     ...sshFieldsFromInput(input),
   }
-  writeConnections([...getRemoteConnections(), connection])
+  if (normalized.token) connection.token = normalized.token
+  if (input.aggregateSessions === false) connection.aggregateSessions = false
+  await persistConnections([...getRemoteConnections(), connection])
   return connection
 }
 
-export function updateRemoteConnection(
+export async function updateRemoteConnection(
   id: string,
   input: RemoteConnectionInput
-): RemoteConnection {
+): Promise<RemoteConnection> {
   const normalized = parseRemoteConnectionInput(input.url, input.token)
+  const connections = getRemoteConnections()
+  const existing = connections.find(connection => connection.id === id)
+  if (!existing) {
+    throw new Error('Remote connection not found.')
+  }
   const updated: RemoteConnection = {
     id,
     name: input.name.trim() || new URL(normalized.url).hostname,
-    ...normalized,
+    url: normalized.url,
     ...sshFieldsFromInput(input),
   }
-  const connections = getRemoteConnections()
-  if (!connections.some(connection => connection.id === id)) {
-    throw new Error('Remote connection not found.')
-  }
-  writeConnections(
+  // Write-only token: overwrite only when a new token was entered; otherwise
+  // keep the previously stored one (web clients never see the masked token).
+  const token = normalized.token || existing.token
+  if (token) updated.token = token
+  // The edit form does not own this flag: an omitted value keeps the toggle
+  // where the sidebar list left it.
+  const aggregate = input.aggregateSessions ?? existing.aggregateSessions
+  if (aggregate === false) updated.aggregateSessions = false
+  await persistConnections(
     connections.map(connection => (connection.id === id ? updated : connection))
   )
   return updated
 }
 
-export function removeRemoteConnection(id: string): void {
-  writeConnections(
+export async function removeRemoteConnection(id: string): Promise<void> {
+  await persistConnections(
     getRemoteConnections().filter(connection => connection.id !== id)
   )
-  if (getActiveConnectionId() === id) selectConnection(LOCAL_CONNECTION_ID)
+  // Compare the raw saved id: the lazy getter already resolves a removed
+  // connection to 'local', which would skip clearing the stored selection.
+  if (activeConnectionSnapshot === id) selectConnection(LOCAL_CONNECTION_ID)
+}
+
+/**
+ * Turn sidebar aggregation on or off for one connection.
+ *
+ * Kept out of `updateRemoteConnection` on purpose: the toggle lives in the
+ * connections list, not in the edit form, and must not require re-entering a
+ * token to flip.
+ */
+export async function setConnectionAggregation(
+  id: string,
+  enabled: boolean
+): Promise<void> {
+  const connections = getRemoteConnections()
+  const existing = connections.find(connection => connection.id === id)
+  if (!existing || aggregatesSessions(existing) === enabled) return
+  await persistConnections(
+    connections.map(connection => {
+      if (connection.id !== id) return connection
+      const next = { ...connection }
+      if (enabled) delete next.aggregateSessions
+      else next.aggregateSessions = false
+      return next
+    })
+  )
 }
 
 export function getActiveConnectionId(): string {
-  return activeConnectionSnapshot
+  if (activeConnectionSnapshot === LOCAL_CONNECTION_ID) {
+    return LOCAL_CONNECTION_ID
+  }
+  return connectionsSnapshot.some(
+    connection => connection.id === activeConnectionSnapshot
+  )
+    ? activeConnectionSnapshot
+    : LOCAL_CONNECTION_ID
 }
 
 export function getActiveRemoteConnection(): RemoteConnection | null {
@@ -229,7 +378,7 @@ export function selectConnection(id: string): void {
       : LOCAL_CONNECTION_ID
   activeConnectionSnapshot = selected
   storage()?.setItem(ACTIVE_CONNECTION_KEY, selected)
-  for (const subscriber of subscribers) subscriber()
+  notifySubscribers()
 }
 
 export function markConnectionSwitch(): void {

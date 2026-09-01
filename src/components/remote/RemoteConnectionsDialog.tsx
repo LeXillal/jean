@@ -21,18 +21,21 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Switch } from '@/components/ui/switch'
 import { Spinner } from '@/components/ui/spinner'
 import { isNativeApp } from '@/lib/environment'
 import { cn } from '@/lib/utils'
 import {
   LOCAL_CONNECTION_ID,
   addRemoteConnection,
+  aggregatesSessions,
   getActiveConnectionId,
   markConnectionSwitch,
   parseOptionalSshPort,
   parseRemoteConnectionInput,
   removeRemoteConnection,
   selectConnection,
+  setConnectionAggregation,
   updateRemoteConnection,
   useRemoteConnections,
   type RemoteConnection,
@@ -46,7 +49,11 @@ import {
   isInvalidTokenError,
   warnRemoteVersionMismatch,
 } from '@/lib/remote-version'
-import { invoke, listenLocal } from '@/lib/transport'
+import {
+  invoke,
+  listenLocal,
+  probeConnectionServerInfo,
+} from '@/lib/transport'
 
 const EMPTY_URL_FORM = {
   name: '',
@@ -163,10 +170,7 @@ export function RemoteConnectionsDialog({
     const results = await Promise.all(
       items.map(async connection => {
         try {
-          const info = await fetchRemoteServerInfo(
-            connection.url,
-            connection.token
-          )
+          const info = await probeConnectionServerInfo(connection)
           return [
             connection.id,
             {
@@ -210,7 +214,9 @@ export function RemoteConnectionsDialog({
         setForm({
           name: connection.name,
           url: connection.url,
-          token: connection.token,
+          // Never pre-fill the token: web clients no longer receive it, and it
+          // is a write-only field (leave blank to keep the saved token).
+          token: '',
           sshUser: connection.sshUser ?? '',
           sshHost: connection.sshHost ?? '',
           sshPort: String(connection.sshPort ?? 22),
@@ -273,7 +279,9 @@ export function RemoteConnectionsDialog({
     setForm({
       name: connection.name,
       url: connection.url,
-      token: connection.token,
+      // Never pre-fill the token: web clients no longer receive it, and it is a
+      // write-only field (leave blank to keep the saved token).
+      token: '',
       sshUser: connection.sshUser ?? '',
       sshHost: connection.sshHost ?? '',
       sshPort: String(connection.sshPort ?? 22),
@@ -313,10 +321,7 @@ export function RemoteConnectionsDialog({
     try {
       // Best-effort probe so the user sees a version toast before reload;
       // transport re-checks after connect. Failures do not block switching.
-      const info = await fetchRemoteServerInfo(
-        connection.url,
-        connection.token
-      )
+      const info = await probeConnectionServerInfo(connection)
       warnRemoteVersionMismatch(info.appVersion)
     } catch {
       // Unreachable remotes still switch so recovery UI can handle them.
@@ -339,21 +344,26 @@ export function RemoteConnectionsDialog({
       const normalized = parseRemoteConnectionInput(input.url, input.token)
 
       if (editingId === 'new') {
-        try {
-          const info = await fetchRemoteServerInfo(
-            normalized.url,
-            normalized.token
-          )
-          warnRemoteVersionMismatch(info.appVersion)
-        } catch (probeError) {
-          // Still allow save/connect; transport/recovery handles auth/network.
-          // Surface probe failures only when we cannot normalize further.
-          if (isInvalidTokenError(probeError)) {
-            setError((probeError as Error).message)
-            return
+        // Web clients cannot probe an unregistered remote (no id to proxy
+        // through, and the browser holds no remote token). The token is
+        // validated once the proxy connects. Native keeps the direct probe.
+        if (native) {
+          try {
+            const info = await fetchRemoteServerInfo(
+              normalized.url,
+              normalized.token
+            )
+            warnRemoteVersionMismatch(info.appVersion)
+          } catch (probeError) {
+            // Still allow save/connect; transport/recovery handles auth/network.
+            // Surface probe failures only when we cannot normalize further.
+            if (isInvalidTokenError(probeError)) {
+              setError((probeError as Error).message)
+              return
+            }
           }
         }
-        const connection = addRemoteConnection(input)
+        const connection = await addRemoteConnection(input)
         markConnectionSwitch()
         selectConnection(connection.id)
         reloadApp()
@@ -361,21 +371,25 @@ export function RemoteConnectionsDialog({
       }
       if (editingId) {
         if (editingId === activeId) {
-          try {
-            const info = await fetchRemoteServerInfo(
-              normalized.url,
-              normalized.token
-            )
-            warnRemoteVersionMismatch(info.appVersion)
-          } catch {
-            // Allow reconnect; recovery screen handles hard failures.
+          // Native re-probes directly before reload; web relies on the proxy
+          // re-checking after connect (it may not hold a token for a new URL).
+          if (native) {
+            try {
+              const info = await fetchRemoteServerInfo(
+                normalized.url,
+                normalized.token
+              )
+              warnRemoteVersionMismatch(info.appVersion)
+            } catch {
+              // Allow reconnect; recovery screen handles hard failures.
+            }
           }
-          updateRemoteConnection(editingId, input)
+          await updateRemoteConnection(editingId, input)
           markConnectionSwitch()
           reloadApp()
           return
         }
-        const updated = updateRemoteConnection(editingId, input)
+        const updated = await updateRemoteConnection(editingId, input)
         // Probe after save so the list shows the new version promptly.
         void refreshVersions(
           connections.map(item => (item.id === editingId ? updated : item))
@@ -440,7 +454,7 @@ export function RemoteConnectionsDialog({
         throw new Error('Remote jean-server did not report ready.')
       }
 
-      const connection = addRemoteConnection({
+      const connection = await addRemoteConnection({
         name: result.name,
         url: result.url,
         token: result.token,
@@ -462,12 +476,29 @@ export function RemoteConnectionsDialog({
     }
   }
 
-  const handleDelete = (id: string) => {
+  const handleDelete = async (id: string) => {
     const wasActive = id === activeId
-    removeRemoteConnection(id)
+    try {
+      await removeRemoteConnection(id)
+    } catch (deleteError) {
+      setError(
+        deleteError instanceof Error ? deleteError.message : String(deleteError)
+      )
+      return
+    }
     if (wasActive) {
       markConnectionSwitch()
       reloadApp()
+    }
+  }
+
+  const handleToggleAggregation = async (id: string, enabled: boolean) => {
+    try {
+      await setConnectionAggregation(id, enabled)
+    } catch (toggleError) {
+      setError(
+        toggleError instanceof Error ? toggleError.message : String(toggleError)
+      )
     }
   }
 
@@ -697,7 +728,11 @@ export function RemoteConnectionsDialog({
                       token: event.target.value,
                     }))
                   }
-                  placeholder="Optional when included in the URL"
+                  placeholder={
+                    isNew
+                      ? 'Optional when included in the URL'
+                      : 'Saved — leave blank to keep the current token'
+                  }
                   disabled={connectingId !== null}
                 />
               </div>
@@ -823,6 +858,15 @@ export function RemoteConnectionsDialog({
                   onSelect={() => void switchTo(connection.id)}
                   onEdit={() => beginEdit(connection)}
                   onDelete={() => handleDelete(connection.id)}
+                  aggregate={
+                    native ? undefined : aggregatesSessions(connection)
+                  }
+                  onToggleAggregate={
+                    native
+                      ? undefined
+                      : enabled =>
+                          void handleToggleAggregation(connection.id, enabled)
+                  }
                 />
               )
             })}
@@ -906,6 +950,8 @@ function ConnectionRow({
   onSelect,
   onEdit,
   onDelete,
+  aggregate,
+  onToggleAggregate,
 }: {
   name: string
   detail: string
@@ -917,8 +963,12 @@ function ConnectionRow({
   onSelect: () => void
   onEdit?: () => void
   onDelete?: () => void
+  /** Undefined for rows that cannot opt out (the local server). */
+  aggregate?: boolean
+  onToggleAggregate?: (enabled: boolean) => void
 }) {
   const hasActions = Boolean(onEdit || onDelete)
+  const showAggregate = aggregate !== undefined && Boolean(onToggleAggregate)
 
   return (
     <div className="rounded-md border p-2">
@@ -969,6 +1019,23 @@ function ConnectionRow({
         >
           {detail}
         </button>
+        {showAggregate && (
+          <div className="flex shrink-0 items-center gap-1.5 pr-1">
+            <Label
+              htmlFor={`aggregate-${name}`}
+              className="cursor-pointer text-xs font-normal text-muted-foreground"
+              title="Show this instance's sessions in the sidebar. Off keeps it switch-only."
+            >
+              In sidebar
+            </Label>
+            <Switch
+              id={`aggregate-${name}`}
+              checked={aggregate}
+              onCheckedChange={onToggleAggregate}
+              aria-label={`Show ${name} sessions in the sidebar`}
+            />
+          </div>
+        )}
         {hasActions && (
           <div className="flex shrink-0 items-center gap-0.5">
             {onEdit && (

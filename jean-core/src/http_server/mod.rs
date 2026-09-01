@@ -1,6 +1,8 @@
 pub mod assets;
 pub mod auth;
 pub mod dispatch;
+pub mod login_guard;
+pub mod remote_proxy;
 pub mod server;
 pub mod websocket;
 

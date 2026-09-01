@@ -15,38 +15,188 @@ import {
 } from './environment'
 import { generateId } from './uuid'
 import { isServerWindows } from './platform'
-import { getActiveRemoteConnection } from './remote-connections'
+import {
+  LOCAL_CONNECTION_ID,
+  getActiveConnectionId,
+  getActiveRemoteConnection,
+  getRemoteConnections,
+  type RemoteConnection,
+} from './remote-connections'
 import { prepareRemoteEditorOpenArgs } from './remote-editor'
-import { warnRemoteVersionMismatch } from './remote-version'
+import {
+  fetchRemoteServerInfoFromAuthUrl,
+  warnRemoteVersionMismatch,
+  type RemoteServerInfo,
+} from './remote-version'
+
+/**
+ * Why the browser session is not authenticated yet.
+ *
+ * - `signed-out`  — no token has been presented; this is the normal first
+ *   visit and a sign-in prompt, not a failure.
+ * - `rejected`    — a token was presented and the server refused it.
+ * - `unreachable` — the server could not be reached or dropped the session.
+ */
+export type WsAuthReason = 'signed-out' | 'rejected' | 'unreachable'
 
 export function usesWebSocketBackend(): boolean {
   return !isNativeApp() || getActiveRemoteConnection() !== null
 }
 
-function getWebBackendBaseUrl(): string {
-  return getActiveRemoteConnection()?.url ?? window.location.origin
+/**
+ * Resolve an instance id to its remote connection.
+ *
+ * `LOCAL_CONNECTION_ID` (and any id no longer in the list) means "the origin
+ * hub itself" and resolves to `null`, matching {@link getActiveRemoteConnection}.
+ */
+export function connectionForInstance(
+  instanceId: string
+): RemoteConnection | null {
+  if (instanceId === LOCAL_CONNECTION_ID) return null
+  return getRemoteConnections().find(item => item.id === instanceId) ?? null
 }
 
-function getWebBackendToken(): string {
-  const remote = getActiveRemoteConnection()
-  if (remote) return remote.token
+/**
+ * Base URL for backend HTTP/WS requests in web-backend mode.
+ *
+ * - Local web (no remote): the origin hub itself.
+ * - Web + remote: relayed through the origin hub proxy at `/remote/<id>`.
+ *   The browser never holds the remote's own URL/token; the hub relays with
+ *   the hub token only.
+ * - Native app + remote: direct access to the remote's own URL (unchanged).
+ */
+function backendBaseUrlFor(remote: RemoteConnection | null): string {
+  if (!remote) return window.location.origin
+  // Native desktop keeps its direct connection to the remote server.
+  if (isNativeApp()) return remote.url
+  // Web clients relay everything through the origin hub proxy.
+  return `${window.location.origin}/remote/${remote.id}`
+}
+
+function getWebBackendBaseUrl(): string {
+  return backendBaseUrlFor(getActiveRemoteConnection())
+}
+
+/**
+ * Base URL for building `/api/...` asset URLs.
+ *
+ * Mirrors {@link getWebBackendBaseUrl} but stays relative ('') in local web
+ * mode so same-origin asset URLs remain relative (no behavior change).
+ */
+function getWebAssetBaseUrl(): string {
+  return getActiveRemoteConnection() ? getWebBackendBaseUrl() : ''
+}
+
+function backendTokenFor(remote: RemoteConnection | null): string {
+  // Native desktop connecting directly to a remote uses the remote's own token.
+  if (remote && isNativeApp()) return remote.token ?? ''
+  // Web mode (local or remote via proxy): always the hub token. The remote's
+  // token is never exposed to the browser anymore.
   const urlToken = new URLSearchParams(window.location.search).get('token')
   return urlToken || localStorage.getItem('jean-http-token') || ''
 }
 
-function backendUrl(path: string): string {
-  const base = `${getWebBackendBaseUrl().replace(/\/+$/, '')}/`
+function getWebBackendToken(): string {
+  return backendTokenFor(getActiveRemoteConnection())
+}
+
+function backendUrlFor(remote: RemoteConnection | null, path: string): string {
+  const base = `${backendBaseUrlFor(remote).replace(/\/+$/, '')}/`
   return new URL(path.replace(/^\/+/, ''), base).toString()
 }
 
-function fetchBackend(url: string): Promise<Response> {
-  if (!getActiveRemoteConnection()) return fetch(url)
+function backendUrl(path: string): string {
+  return backendUrlFor(getActiveRemoteConnection(), path)
+}
+
+/**
+ * Build the proxied `/api/auth` probe URL for a registered remote connection.
+ *
+ * Web clients no longer hold the remote's token, so version probes must go
+ * through the origin hub proxy with the hub token.
+ */
+export function proxiedRemoteAuthUrl(id: string): string {
+  const token = getWebBackendToken()
+  const base = `${window.location.origin}/remote/${id}/`
+  const authUrl = new URL('api/auth', base)
+  if (token) authUrl.searchParams.set('token', token)
+  return authUrl.toString()
+}
+
+/**
+ * Probe a registered remote connection's server info, choosing the right
+ * transport: native desktop talks to the remote directly with its own token;
+ * web clients relay through the origin hub proxy with the hub token.
+ */
+export async function probeConnectionServerInfo(connection: {
+  id: string
+  url: string
+  token?: string
+}): Promise<RemoteServerInfo> {
+  if (isNativeApp()) {
+    const base = `${connection.url.replace(/\/+$/, '')}/`
+    const authUrl = new URL('api/auth', base)
+    if (connection.token) authUrl.searchParams.set('token', connection.token)
+    return fetchRemoteServerInfoFromAuthUrl(authUrl.toString())
+  }
+  return fetchRemoteServerInfoFromAuthUrl(proxiedRemoteAuthUrl(connection.id))
+}
+
+function fetchBackendFor(
+  remote: RemoteConnection | null,
+  url: string
+): Promise<Response> {
+  // Same-origin hub requests have no timeout; a relayed hop can hang on a
+  // remote that stopped answering, so it gets an abort budget.
+  if (!remote) return fetch(url)
 
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 12_000)
   return fetch(url, { signal: controller.signal }).finally(() =>
     clearTimeout(timeout)
   )
+}
+
+/**
+ * A hub token arriving in the page URL is exchanged for an HttpOnly session
+ * cookie exactly once per load; the reload that follows re-authenticates every
+ * transport from that cookie. Module-scoped so concurrent transports racing to
+ * connect do not each fire the exchange.
+ */
+let urlTokenCookieExchangeStarted = false
+
+/**
+ * Trade a hub token supplied in the URL for an HttpOnly session cookie, exactly
+ * like the sign-in form (see `handleWsAuthTokenSubmit`). This keeps the
+ * long-lived hub token out of localStorage (where any XSS could read it) and
+ * out of the WebSocket/auth query string. Web mode only — native builds have no
+ * same-origin cookie endpoint and keep the legacy localStorage token instead.
+ */
+async function exchangeHubUrlTokenForCookie(token: string): Promise<void> {
+  try {
+    const res = await fetch(`${window.location.origin}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ token }),
+    })
+    if (res.ok) {
+      // The cookie now carries auth; the token must not linger anywhere JS can
+      // read it back.
+      localStorage.removeItem('jean-http-token')
+      window.location.reload()
+      return
+    }
+  } catch {
+    // Older server without /api/login, or offline — fall through to the legacy
+    // token path so the client can still connect (or surface the auth error).
+  }
+  localStorage.setItem('jean-http-token', token)
+  window.location.reload()
+}
+
+function fetchBackend(url: string): Promise<Response> {
+  return fetchBackendFor(getActiveRemoteConnection(), url)
 }
 
 // ---------------------------------------------------------------------------
@@ -91,7 +241,7 @@ export function convertFileSrc(filePath: string, protocol = 'asset'): string {
   // Browser mode: convert server filesystem path to /api/files/ URL
   const token = getWebBackendToken()
   const params = token ? `?token=${encodeURIComponent(token)}` : ''
-  const base = getActiveRemoteConnection()?.url ?? ''
+  const base = getWebAssetBaseUrl()
 
   // Try exact prefix match with cached app data dir
   if (_appDataDir && filePath.startsWith(_appDataDir)) {
@@ -125,7 +275,7 @@ export function convertProjectFileSrc(filePath: string): string {
 
   const token = getWebBackendToken()
   const params = token ? `?token=${encodeURIComponent(token)}` : ''
-  const base = getActiveRemoteConnection()?.url ?? ''
+  const base = getWebAssetBaseUrl()
   return `${base}/api/project-files/${encodeURIComponent(filePath)}${params}`
 }
 
@@ -265,7 +415,7 @@ export async function invoke<T>(
       args: args ?? {},
     })
   }
-  return wsTransport.invoke<T>(command, args)
+  return focusedTransport().invoke<T>(command, args)
 }
 
 /**
@@ -292,7 +442,7 @@ export async function listen<T>(
     const unlisten = await tauriListen<T>(event, handler)
     return containNativeUnlisten(unlisten)
   }
-  return wsTransport.listen<T>(event, handler)
+  return focusedTransport().listen<T>(event, handler)
 }
 
 /** Listen for events emitted by the local desktop shell, even when connected
@@ -314,7 +464,7 @@ export async function listenLocal<T>(
  */
 export function requestTerminalReplay(terminalId: string, lastSeq = 0): void {
   if (!usesWebSocketBackend()) return
-  wsTransport.requestTerminalReplay(terminalId, lastSeq)
+  focusedTransport().requestTerminalReplay(terminalId, lastSeq)
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +607,8 @@ class WsTransport {
   private connectRetryAttempt = 0
   private connectRetryTimer: ReturnType<typeof setTimeout> | null = null
   private connectWatchdog: ReturnType<typeof setTimeout> | null = null
+  /** Fires once a socket has stayed open long enough to count as healthy. */
+  private stabilityTimer: ReturnType<typeof setTimeout> | null = null
   /** Periodic check that we're seeing inbound traffic from the server.
    *  The server sends app-level heartbeats every 20s because browser JS cannot
    *  observe protocol ping/pong frames, so a 50s gap means the connection is dead. */
@@ -475,15 +627,23 @@ class WsTransport {
   private _hasConnectedOnce = false
   private _connecting = false
   private _authError: string | null = null
+  private _authReason: WsAuthReason | null = null
   private _subscribers = new Set<() => void>()
-  private _establishedDisconnectListeners = new Set<() => void>()
   private _connectEnabled = false
+  /** Set by {@link dispose}; nothing may reopen a socket afterwards. */
+  private _disposed = false
+  /** True while this transport is the one that set the global connected flag. */
+  private _drivesGlobalState = false
   /** Track last seen sequence numbers to deduplicate bootstrap replay. */
   private _lastSeqBySession = new Map<string, number>()
   /** Track terminal sequence numbers for explicit full-refresh replay. */
   private _lastSeqByTerminal = new Map<string, number>()
 
-  constructor() {
+  /** Instance this transport talks to; `LOCAL_CONNECTION_ID` is the origin hub. */
+  readonly instanceId: string
+
+  constructor(instanceId: string) {
+    this.instanceId = instanceId
     // Mobile browsers suspend background tabs and freeze JS timers. Check the
     // socket immediately on wake so a stale established connection triggers
     // the app reload without waiting for the periodic liveness timer.
@@ -494,6 +654,24 @@ class WsTransport {
     }
   }
 
+  /**
+   * The connection this transport targets, resolved on every read: in web mode
+   * the connection list arrives asynchronously, so a transport can outlive the
+   * moment its entry appears (or is edited).
+   */
+  private get remote(): RemoteConnection | null {
+    return connectionForInstance(this.instanceId)
+  }
+
+  /**
+   * Only the focused transport owns global UI state (the auth screen, the
+   * "connection lost" reload). Satellites are background readers: they must
+   * never blank the app because a secondary instance went down.
+   */
+  private get isFocused(): boolean {
+    return this.instanceId === getActiveConnectionId()
+  }
+
   get connected(): boolean {
     return this._connected
   }
@@ -502,30 +680,90 @@ class WsTransport {
     return this._authError
   }
 
+  /** Coarse state for the per-instance status indicator. */
+  get status(): InstanceStatus {
+    if (this._connected) return 'connected'
+    if (this._authError) return 'auth-error'
+    if (this._connecting || this.ws?.readyState === WebSocket.CONNECTING) {
+      return 'connecting'
+    }
+    return this._hasConnectedOnce ? 'offline' : 'idle'
+  }
+
   private setConnected(value: boolean): void {
     this._connected = value
-    setWsConnected(value)
+    // Push the global flag down only if this transport is the one that raised
+    // it. Reading `isFocused` on both edges would strand `setWsConnected(true)`
+    // if focus moved between open and close.
+    if (value ? this.isFocused : this._drivesGlobalState) {
+      this._drivesGlobalState = value
+      setWsConnected(value)
+    }
     this.notifySubscribers()
   }
 
-  private setAuthError(error: string | null): void {
+  // Overloads force every caller that sets a message to also classify it —
+  // otherwise the UI cannot tell a first visit from a refused token or a
+  // dead server, and silently picks the wrong screen.
+  private setAuthError(error: null): void
+  private setAuthError(error: string, reason: WsAuthReason): void
+  private setAuthError(error: string | null, reason?: WsAuthReason): void {
     this._authError = error
+    this._authReason = error === null ? null : (reason as WsAuthReason)
+    this.notifySubscribers()
+  }
+
+  /** `_connecting` and the socket's CONNECTING state feed {@link status}. */
+  private setConnecting(value: boolean): void {
+    this._connecting = value
     this.notifySubscribers()
   }
 
   private notifySubscribers(): void {
     for (const cb of this._subscribers) cb()
+    // Registry-level fan-out: hooks that follow "whatever is focused" or watch
+    // every instance's status subscribe once, not per transport.
+    notifyTransportRegistry()
+  }
+
+  /** Tear down sockets/timers for a connection that no longer exists. */
+  dispose(): void {
+    this._disposed = true
+    this._connectEnabled = false
+    this.clearConnectWatchdog()
+    this.clearStabilityTimer()
+    this.stopLivenessTimer()
+    if (this.connectRetryTimer) {
+      clearTimeout(this.connectRetryTimer)
+      this.connectRetryTimer = null
+    }
+    if (typeof window !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.handleWake)
+      window.removeEventListener('online', this.handleWake)
+      window.removeEventListener('pageshow', this.handleWake)
+    }
+    try {
+      this.ws?.close()
+    } catch {
+      // Already closing or never opened.
+    }
+    this.ws = null
+    this.listeners.clear()
+    this.eventBuffer.clear()
+    // Fail callers now instead of leaving them on the 60s command timeout, and
+    // drop anything queued so a disposed transport cannot replay it.
+    for (const [, pending] of this.pending.entries()) {
+      clearTimeout(pending.timeout)
+      pending.reject(new Error('Connection was removed'))
+    }
+    this.pending.clear()
+    this.queue = []
   }
 
   /** Subscribe to state changes. Returns an unsubscribe function. */
   subscribe(callback: () => void): () => void {
     this._subscribers.add(callback)
     return () => this._subscribers.delete(callback)
-  }
-
-  onEstablishedDisconnect(callback: () => void): () => void {
-    this._establishedDisconnectListeners.add(callback)
-    return () => this._establishedDisconnectListeners.delete(callback)
   }
 
   /** Get current connection snapshot for useSyncExternalStore. */
@@ -538,12 +776,20 @@ class WsTransport {
     return this._authError
   }
 
+  /** Get why authentication is pending, for useSyncExternalStore. */
+  getAuthReasonSnapshot(): WsAuthReason | null {
+    return this._authReason
+  }
+
   /** Connect to the WebSocket server (validates token first). */
   connect(): void {
-    if (!this._connectEnabled) return
-    // Established connections recover through a full page reload, never a
-    // second in-memory WebSocket connection.
-    if (this._hasConnectedOnce && !this._connected) return
+    if (!this._connectEnabled || this._disposed) return
+    // The FOCUSED transport recovers through a full page reload, never a
+    // second in-memory WebSocket connection: the bootstrap is what rebuilds
+    // in-flight streams and replay sequences. Satellites carry no such state,
+    // so they reconnect in place — a secondary instance going down must not
+    // drag the whole app through a reload.
+    if (this._hasConnectedOnce && !this._connected && this.isFocused) return
     if (
       this._connecting ||
       this.ws?.readyState === WebSocket.OPEN ||
@@ -551,26 +797,42 @@ class WsTransport {
     )
       return
 
-    const remote = getActiveRemoteConnection()
-    // Read token from URL query param or localStorage
+    // Native desktop pointing directly at a remote uses the remote's own token;
+    // every web client (local or remote via proxy) uses the hub token.
+    const remote = this.remote
+    const isDirectNativeRemote = Boolean(remote) && isNativeApp()
+    const token = backendTokenFor(remote)
     const urlToken = new URLSearchParams(window.location.search).get('token')
-    const token =
-      remote?.token || urlToken || localStorage.getItem('jean-http-token') || ''
 
-    // Persist token from URL to localStorage for future page loads
-    if (!remote && urlToken) {
-      localStorage.setItem('jean-http-token', urlToken)
-
-      // Remove token from URL for security (prevent history/bookmark exposure)
+    // A hub token in the URL must not become a long-lived, XSS-readable
+    // localStorage entry (nor keep riding in the WS/auth query string).
+    if (!isDirectNativeRemote && urlToken) {
+      // Strip the token from the URL first (history/bookmark hygiene), so the
+      // post-exchange reload lands on a clean URL and cannot loop.
       const url = new URL(window.location.href)
       url.searchParams.delete('token')
       window.history.replaceState({}, '', url.toString())
+
+      if (!isNativeApp()) {
+        // Web: exchange the URL token for an HttpOnly session cookie, then let
+        // the reload re-authenticate from the cookie. Run once — the first
+        // transport to boot drives it for all of them.
+        if (!urlTokenCookieExchangeStarted) {
+          urlTokenCookieExchangeStarted = true
+          void exchangeHubUrlTokenForCookie(urlToken)
+        }
+        return
+      }
+
+      // Native builds have no same-origin cookie endpoint; keep the token in
+      // machine-local storage as before.
+      localStorage.setItem('jean-http-token', urlToken)
     }
 
-    this._connecting = true
+    this.setConnecting(true)
 
     this.validateAndConnect(token).finally(() => {
-      this._connecting = false
+      this.setConnecting(false)
     })
   }
 
@@ -581,23 +843,35 @@ class WsTransport {
   }
 
   private async validateAndConnect(token: string): Promise<void> {
-    const authBaseUrl = backendUrl('api/auth')
+    const remote = this.remote
+    const authBaseUrl = backendUrlFor(remote, 'api/auth')
     const authUrl = token
       ? `${authBaseUrl}?token=${encodeURIComponent(token)}`
       : authBaseUrl
-    const remote = getActiveRemoteConnection()
 
     try {
-      const res = await fetchBackend(authUrl)
+      const res = await fetchBackendFor(remote, authUrl)
       if (!res.ok) {
+        // A satellite has no UI to prompt with, so it must tell "refused" from
+        // "not answering". Only 401/403 is a credential problem worth stopping
+        // for; anything else (a 502 from the proxy when the remote is down) is
+        // transient and has to keep retrying, or the instance never returns.
+        if (!this.isFocused && res.status !== 401 && res.status !== 403) {
+          this.setAuthError(null)
+          this.scheduleConnectRetry()
+          return
+        }
         // Invalid token — clear it and wait for the user to provide another.
-        if (!remote) {
+        // Only the focused transport may do this: a satellite must not sign
+        // the whole app out because one secondary instance refused it.
+        if (!remote && this.isFocused) {
           localStorage.removeItem('jean-http-token')
         }
         this.setAuthError(
           token
-            ? "Invalid access token. Check the URL in Jean's Web Access settings."
-            : "No access token provided. Use the URL from Jean's Web Access settings."
+            ? "That access token was refused. Check the token in Jean's Web Access settings."
+            : "Enter the access token from Jean's Web Access settings.",
+          token ? 'rejected' : 'signed-out'
         )
         return
       }
@@ -613,18 +887,25 @@ class WsTransport {
         }
       }
     } catch {
-      if (remote) {
+      if (remote && this.isFocused) {
         this.setAuthError(
-          "Jean could not reach the server's authentication endpoint. Check that the server is running and the URL and port are correct. If the address opens in a browser, update and restart the remote Jean server so it allows desktop connections (CORS)."
+          "Jean could not reach the server's authentication endpoint. Check that the server is running and the URL and port are correct. If the address opens in a browser, update and restart the remote Jean server so it allows desktop connections (CORS).",
+          'unreachable'
         )
         return
       }
-      // The initial page load may race server startup. Retry connecting until
-      // the first successful socket; established sockets use a page reload.
+      // The initial page load may race server startup, and a satellite's server
+      // can go down at any time. Both retry: an unreachable server is not an
+      // auth failure, and setting one here would stop the retry loop for good.
       this.setAuthError(null)
       this.scheduleConnectRetry()
       return
     }
+
+    // The connection may have been deleted while the probe was in flight; its
+    // transport is gone from the registry, so a socket opened now could never
+    // be closed — and would resolve to the hub, not to the removed remote.
+    if (this._disposed || !this._connectEnabled) return
 
     // Token valid (or not required) — clear any previous auth error and connect
     this.setAuthError(null)
@@ -632,7 +913,7 @@ class WsTransport {
   }
 
   private connectWs(token: string): void {
-    const base = new URL(backendUrl('ws'))
+    const base = new URL(backendUrlFor(this.remote, 'ws'))
     base.protocol = base.protocol === 'https:' ? 'wss:' : 'ws:'
     base.searchParams.set('token', token)
     const url = base.toString()
@@ -658,7 +939,16 @@ class WsTransport {
       this.startLivenessTimer()
       this._hasConnectedOnce = true
       this.setConnected(true)
-      this.connectRetryAttempt = 0
+      // Do NOT clear the backoff here. The hub accepts the WebSocket upgrade
+      // before it knows whether the remote is reachable, so a dead remote
+      // produces open-then-immediately-close. Resetting on open would pin the
+      // delay at 100ms forever and hammer the hub — and through it, the remote.
+      // Only a connection that stayed up counts as proven.
+      this.clearStabilityTimer()
+      this.stabilityTimer = setTimeout(() => {
+        this.stabilityTimer = null
+        this.connectRetryAttempt = 0
+      }, WsTransport.STABLE_CONNECTION_MS)
 
       // Flush queued messages
       for (const item of this.queue) {
@@ -687,8 +977,12 @@ class WsTransport {
     this.ws.onclose = () => {
       const wasConnected = this._connected
 
-      if (wasConnected) {
-        for (const callback of this._establishedDisconnectListeners) {
+      // Only the transport that drove the app triggers the reload path. The
+      // listeners live on the registry, not on this instance: App.tsx
+      // subscribes during its first render, before the connection list has
+      // loaded, when the focused id still reads as 'local'.
+      if (wasConnected && this._drivesGlobalState) {
+        for (const callback of establishedDisconnectListeners) {
           try {
             callback()
           } catch (error) {
@@ -701,12 +995,16 @@ class WsTransport {
       }
 
       this.clearConnectWatchdog()
+      this.clearStabilityTimer()
       this.stopLivenessTimer()
       this.ws = null
 
       this.setConnected(false)
-      if (wasConnected && getActiveRemoteConnection()) {
-        this.setAuthError('Connection to the selected Jean server was lost.')
+      if (wasConnected && this.remote && this.isFocused) {
+        this.setAuthError(
+          'Connection to the selected Jean server was lost.',
+          'unreachable'
+        )
       }
 
       // Clear event buffer — stale events from a dead connection
@@ -726,7 +1024,10 @@ class WsTransport {
       // spawn duplicate CLI processes.
       this.queue = []
 
-      if (!wasConnected && !this._hasConnectedOnce) {
+      // Satellites always recover in place. The focused transport only retries
+      // while it has never connected; once established it waits for the
+      // app-level reload path above.
+      if (!this.isFocused || (!wasConnected && !this._hasConnectedOnce)) {
         this.scheduleConnectRetry()
       }
     }
@@ -765,6 +1066,8 @@ class WsTransport {
   private static readonly LONG_TIMEOUT = 30 * 60_000
   private static readonly DEFAULT_TIMEOUT = 60_000
   private static readonly CONNECT_TIMEOUT = 12_000
+  /** How long a socket must stay open before its backoff counter is cleared. */
+  private static readonly STABLE_CONNECTION_MS = 10_000
   private static readonly MAX_QUEUE_SIZE = 500
   /** If no inbound traffic for this long, assume connection is dead.
    *  Must exceed the server's app-level heartbeat interval (20s); protocol
@@ -917,6 +1220,24 @@ class WsTransport {
         pending.reject(new Error(msg.error || 'Unknown error'))
       }
     } else if (msg.type === 'event' && msg.event) {
+      // A satellite subscribes to a couple of list-level events, but the server
+      // broadcasts everything to every client. Drop what nobody is listening
+      // for instead of buffering it: replay dedup and the listener-gap buffer
+      // only matter for the transport that drives the app, and unbounded
+      // per-session sequence tracking on a firehose is pure leak.
+      if (!this.isFocused) {
+        const satelliteHandlers = this.listeners.get(msg.event)
+        if (!satelliteHandlers?.size) return
+        for (const handler of satelliteHandlers) {
+          try {
+            handler({ payload: msg.payload })
+          } catch (e) {
+            console.error(`[WsTransport] Error in '${msg.event}' handler:`, e)
+          }
+        }
+        return
+      }
+
       // Track sequence numbers for bootstrap/live overlap deduplication.
       if (msg.seq != null && msg.payload) {
         const payload = msg.payload as Record<string, unknown>
@@ -968,7 +1289,11 @@ class WsTransport {
   }
 
   private scheduleConnectRetry(): void {
-    if (this.connectRetryTimer || this._hasConnectedOnce) return
+    if (this.connectRetryTimer) return
+    // The focused transport only retries before its first connection; after
+    // that the app reloads instead. Satellites keep retrying indefinitely so
+    // an instance that comes back online rejoins the aggregated view on its own.
+    if (this._hasConnectedOnce && this.isFocused) return
     // Don't retry if there's an auth error — user needs to fix the token.
     if (this._authError) return
 
@@ -989,6 +1314,12 @@ class WsTransport {
     if (!this.connectWatchdog) return
     clearTimeout(this.connectWatchdog)
     this.connectWatchdog = null
+  }
+
+  private clearStabilityTimer(): void {
+    if (!this.stabilityTimer) return
+    clearTimeout(this.stabilityTimer)
+    this.stabilityTimer = null
   }
 
   private startLivenessTimer(): void {
@@ -1040,7 +1371,9 @@ class WsTransport {
     }
 
     // Before the first successful connection, retry immediately on wake.
-    if (this._hasConnectedOnce) return
+    // Satellites also retry on wake after a drop; the focused transport does
+    // not, because an established drop reloads the app instead.
+    if (this._hasConnectedOnce && this.isFocused) return
     if (this.connectRetryTimer) {
       clearTimeout(this.connectRetryTimer)
       this.connectRetryTimer = null
@@ -1073,16 +1406,160 @@ class WsTransport {
   }
 }
 
-// Singleton instance
-const wsTransport = new WsTransport()
+// ---------------------------------------------------------------------------
+// Transport registry (one WebSocket per Jean instance)
+// ---------------------------------------------------------------------------
+
+/**
+ * One transport per instance id. The FOCUSED instance is whatever
+ * {@link getActiveConnectionId} returns — focus is derived, never stored here,
+ * so selecting another connection re-points the bare `invoke()`/`listen()`
+ * helpers without any bookkeeping. Every other live transport is a SATELLITE:
+ * a background reader used for the aggregated session list.
+ */
+const transports = new Map<string, WsTransport>()
+const registrySubscribers = new Set<() => void>()
+/**
+ * App-level "the connection I was using just dropped" callbacks.
+ *
+ * Registry-scoped on purpose: subscribers register at first render, while the
+ * connection list is still loading and the focused id has not resolved yet, so
+ * binding them to a particular transport would attach them to the wrong one.
+ */
+const establishedDisconnectListeners = new Set<() => void>()
+let registryVersion = 0
+
+function notifyTransportRegistry(): void {
+  registryVersion++
+  for (const cb of registrySubscribers) cb()
+}
+
+/**
+ * Monotonic counter bumped on every transport state change. A number is a
+ * stable `useSyncExternalStore` snapshot; the statuses themselves are derived
+ * from it, which a freshly-built array could not be.
+ */
+export function getTransportRegistryVersion(): number {
+  return registryVersion
+}
+
+/** Subscribe to any transport's state change (connection, auth, focus). */
+export function subscribeToTransports(callback: () => void): () => void {
+  registrySubscribers.add(callback)
+  return () => {
+    registrySubscribers.delete(callback)
+  }
+}
+
+/** Get (creating if needed) the transport for an instance. */
+export function getTransport(instanceId: string): WsTransport {
+  const existing = transports.get(instanceId)
+  if (existing) return existing
+  const created = new WsTransport(instanceId)
+  transports.set(instanceId, created)
+  return created
+}
+
+/** Look up a transport without creating one — safe to call during render. */
+function peekTransport(instanceId: string): WsTransport | undefined {
+  return transports.get(instanceId)
+}
+
+function focusedTransport(): WsTransport {
+  return getTransport(getActiveConnectionId())
+}
+
+/** Drop a transport whose connection was deleted, closing its socket. */
+export function releaseTransport(instanceId: string): void {
+  const transport = transports.get(instanceId)
+  if (!transport) return
+  transports.delete(instanceId)
+  transport.dispose()
+  notifyTransportRegistry()
+}
+
+/** Ids of every instance with a live transport (focused included). */
+export function getLiveTransportIds(): string[] {
+  return [...transports.keys()]
+}
+
+export type InstanceStatus =
+  | 'idle'
+  | 'connecting'
+  | 'connected'
+  | 'offline'
+  | 'auth-error'
+
+/** Current status of an instance; 'idle' when no transport exists yet. */
+export function getInstanceStatus(instanceId: string): InstanceStatus {
+  if (isNativeApp() && instanceId === LOCAL_CONNECTION_ID) return 'connected'
+  return peekTransport(instanceId)?.status ?? 'idle'
+}
+
+/**
+ * Open (or reuse) a background transport for an instance that is not focused.
+ * No-op in native mode for the local instance, which talks over Tauri IPC.
+ */
+export function ensureSatelliteTransport(instanceId: string): void {
+  if (isE2eMocked) return
+  if (isNativeApp() && instanceId === LOCAL_CONNECTION_ID) return
+  getTransport(instanceId).enableConnect()
+}
+
+/** True when this instance is reached through the local Tauri IPC bridge. */
+function usesNativeIpc(instanceId: string): boolean {
+  return isNativeApp() && instanceId === LOCAL_CONNECTION_ID
+}
+
+/**
+ * Call a command on a specific instance. The focused instance goes through the
+ * normal {@link invoke} path (native IPC, editor remapping, E2E mocks);
+ * satellites go straight to their own WebSocket.
+ */
+export async function invokeOn<T>(
+  instanceId: string,
+  command: string,
+  args?: Record<string, unknown>
+): Promise<T> {
+  if (instanceId === getActiveConnectionId()) return invoke<T>(command, args)
+  if (usesNativeIpc(instanceId)) {
+    const { invoke: tauriInvoke } = await import('@tauri-apps/api/core')
+    return tauriInvoke<T>('dispatch_core_command', {
+      command,
+      args: args ?? {},
+    })
+  }
+  return getTransport(instanceId).invoke<T>(command, args)
+}
+
+/**
+ * Listen for an event on a specific instance. Satellite handlers receive the
+ * originating instance id so callers can never mix two instances' payloads.
+ */
+export async function listenOn<T>(
+  instanceId: string,
+  event: string,
+  handler: (event: { payload: T; instanceId: string }) => void
+): Promise<() => void> {
+  if (instanceId === getActiveConnectionId() || usesNativeIpc(instanceId)) {
+    return listen<T>(event, payload => handler({ ...payload, instanceId }))
+  }
+  return getTransport(instanceId).listen<T>(event, payload =>
+    handler({ ...payload, instanceId })
+  )
+}
 
 // ---------------------------------------------------------------------------
 // React hooks for connection status (browser mode only)
 // ---------------------------------------------------------------------------
 
-const subscribe = (cb: () => void) => wsTransport.subscribe(cb)
-const getSnapshot = () => wsTransport.getSnapshot()
-const getAuthErrorSnapshot = () => wsTransport.getAuthErrorSnapshot()
+const subscribe = (cb: () => void) => subscribeToTransports(cb)
+const getSnapshot = () =>
+  peekTransport(getActiveConnectionId())?.getSnapshot() ?? false
+const getAuthErrorSnapshot = () =>
+  peekTransport(getActiveConnectionId())?.getAuthErrorSnapshot() ?? null
+const getAuthReasonSnapshot = () =>
+  peekTransport(getActiveConnectionId())?.getAuthReasonSnapshot() ?? null
 
 // E2E mock: always report connected, no auth errors
 const isE2eMocked =
@@ -1106,12 +1583,15 @@ export function useWsConnectionStatus(): boolean {
 export function connectTransport(): void {
   if (!usesWebSocketBackend() || isE2eMocked) return
   setWebAccessEnabled(true)
-  wsTransport.enableConnect()
+  focusedTransport().enableConnect()
 }
 
-/** Run immediately when an established browser WebSocket disconnects. */
+/** Run immediately when the established browser WebSocket in use disconnects. */
 export function onEstablishedWsDisconnect(callback: () => void): () => void {
-  return wsTransport.onEstablishedDisconnect(callback)
+  establishedDisconnectListeners.add(callback)
+  return () => {
+    establishedDisconnectListeners.delete(callback)
+  }
 }
 
 /**
@@ -1121,13 +1601,13 @@ export function onEstablishedWsDisconnect(callback: () => void): () => void {
  */
 export function isTransportConnected(): boolean {
   if (!usesWebSocketBackend() || isE2eMocked) return true
-  return wsTransport.connected
+  return focusedTransport().connected
 }
 
 /** Feed replayed server events through the normal event pipeline before connect. */
 export function ingestBootstrapEvents(events: BootstrapEvent[]): void {
   if (events.length === 0) return
-  wsTransport.ingestBootstrapEvents(events)
+  focusedTransport().ingestBootstrapEvents(events)
 }
 
 /**
@@ -1139,4 +1619,35 @@ export function useWsAuthError(): string | null {
     isE2eMocked ? noopSubscribe : subscribe,
     isE2eMocked ? () => null : getAuthErrorSnapshot
   )
+}
+
+/**
+ * React hook that returns why authentication is pending, or null when the
+ * session is authenticated. Lets the UI tell a first visit apart from a
+ * refused token instead of reporting both as a connection failure.
+ */
+export function useWsAuthReason(): WsAuthReason | null {
+  return useSyncExternalStore(
+    isE2eMocked ? noopSubscribe : subscribe,
+    isE2eMocked ? () => null : getAuthReasonSnapshot
+  )
+}
+
+/**
+ * Forget the access token stored in this browser and return to the sign-in
+ * screen. Only affects this device — the server keeps running and other
+ * browsers stay signed in.
+ */
+export function signOutOfWebAccess(): void {
+  localStorage.removeItem('jean-http-token')
+  // Reload on a bare origin. A bookmarked `?token=...` takes priority over
+  // localStorage on boot, so keeping the current URL would sign us straight
+  // back in and make the button look broken.
+  const leave = () => window.location.replace(`${window.location.origin}/`)
+  // Also clear the server-side session cookie, then leave regardless of the
+  // result (older servers without /api/logout must not block sign-out).
+  fetch(`${window.location.origin}/api/logout`, {
+    method: 'POST',
+    credentials: 'same-origin',
+  }).then(leave, leave)
 }

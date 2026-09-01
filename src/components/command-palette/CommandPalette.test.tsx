@@ -6,6 +6,7 @@ Element.prototype.scrollIntoView = vi.fn()
 
 const {
   fetchRemoteServerInfo,
+  fetchRemoteServerInfoFromAuthUrl,
   markConnectionSwitch,
   reloadApp,
   selectConnection,
@@ -14,6 +15,11 @@ const {
   warnRemoteVersionMismatch,
 } = vi.hoisted(() => ({
   fetchRemoteServerInfo: vi.fn(async () => ({
+    ok: true,
+    appVersion: '0.1.69',
+    webBuildId: '0.1.69-test',
+  })),
+  fetchRemoteServerInfoFromAuthUrl: vi.fn(async () => ({
     ok: true,
     appVersion: '0.1.69',
     webBuildId: '0.1.69-test',
@@ -87,14 +93,21 @@ vi.mock('@/lib/commands', () => ({
 vi.mock('@/lib/remote-connections', () => ({
   LOCAL_CONNECTION_ID: 'local',
   getActiveConnectionId: () => 'remote-1',
+  // transport.ts reads this at module scope; omitting it made
+  // probeConnectionServerInfo throw into the palette's silent catch.
+  getActiveRemoteConnection: () => remoteConnections[0],
   getRemoteConnections: () => remoteConnections,
   markConnectionSwitch,
   selectConnection,
   useRemoteConnections: () => remoteConnections,
 }))
 
+// The palette probes through the hub proxy (`probeConnectionServerInfo`),
+// which resolves the remote's `/api/auth` URL itself instead of taking a
+// url/token pair.
 vi.mock('@/lib/remote-version', () => ({
   fetchRemoteServerInfo,
+  fetchRemoteServerInfoFromAuthUrl,
   warnRemoteVersionMismatch,
 }))
 
@@ -141,11 +154,11 @@ describe('CommandPalette connections', () => {
     expect(markConnectionSwitch).toHaveBeenCalledOnce()
     expect(selectConnection).toHaveBeenCalledWith('local')
     expect(reloadApp).toHaveBeenCalledOnce()
-    expect(fetchRemoteServerInfo).not.toHaveBeenCalled()
+    expect(fetchRemoteServerInfoFromAuthUrl).not.toHaveBeenCalled()
   })
 
   it('warns on version mismatch but still switches from the palette', async () => {
-    fetchRemoteServerInfo.mockResolvedValueOnce({
+    fetchRemoteServerInfoFromAuthUrl.mockResolvedValueOnce({
       ok: true,
       appVersion: '0.2.0',
       webBuildId: '0.2.0-test',
@@ -157,9 +170,9 @@ describe('CommandPalette connections', () => {
     fireEvent.click(screen.getByText('Build server'))
 
     await waitFor(() => {
-      expect(fetchRemoteServerInfo).toHaveBeenCalledWith(
-        'https://build.example.com',
-        'build-token'
+      // Probed through the hub proxy, never with the remote's own token.
+      expect(fetchRemoteServerInfoFromAuthUrl).toHaveBeenCalledWith(
+        expect.stringContaining('/remote/remote-2/api/auth')
       )
       expect(warnRemoteVersionMismatch).toHaveBeenCalledWith('0.2.0')
       expect(selectConnection).toHaveBeenCalledWith('remote-2')

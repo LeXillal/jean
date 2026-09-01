@@ -99,7 +99,18 @@ export async function fetchRemoteServerInfo(
   token: string,
   fetchImpl: typeof fetch = fetch
 ): Promise<RemoteServerInfo> {
-  const authUrl = buildRemoteAuthUrl(url, token)
+  return fetchRemoteServerInfoFromAuthUrl(buildRemoteAuthUrl(url, token), fetchImpl)
+}
+
+/**
+ * Fetch and parse `/api/auth` from a fully-built URL. Lets callers point at a
+ * proxied endpoint (`<origin>/remote/<id>/api/auth?token=<hubToken>`) when the
+ * browser no longer holds the remote's own token.
+ */
+export async function fetchRemoteServerInfoFromAuthUrl(
+  authUrl: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<RemoteServerInfo> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 12_000)
 

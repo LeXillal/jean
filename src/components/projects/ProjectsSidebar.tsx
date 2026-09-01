@@ -12,6 +12,7 @@ import { useProjectsStore } from '@/store/projects-store'
 import { useUIStore } from '@/store/ui-store'
 import { useIsMobile } from '@/hooks/use-mobile'
 import { ProjectTree } from './ProjectTree'
+import { SatelliteInstances } from './SatelliteInstances'
 import { useInstalledBackends } from '@/hooks/useInstalledBackends'
 import { scheduleIdleWork } from '@/lib/idle'
 
@@ -57,7 +58,9 @@ export function ProjectsSidebar() {
             <span className="text-sm text-muted-foreground">Loading...</span>
           </div>
         ) : projects.length === 0 ? (
-          <div className="flex h-full items-center justify-center px-2">
+          // Not h-full: other instances' sections render below and must stay
+          // visible for someone whose local server has no projects yet.
+          <div className="flex items-center justify-center px-2 py-8">
             <span className="truncate text-sm text-muted-foreground/50">
               No projects found
             </span>
@@ -65,6 +68,7 @@ export function ProjectsSidebar() {
         ) : (
           <ProjectTree projects={projects} />
         )}
+        <SatelliteInstances ready={!isLoading} />
       </div>
 
       {/* Footer - transparent buttons with hover background.
