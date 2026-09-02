@@ -5,7 +5,9 @@ import {
 } from '@/lib/remote-connections'
 import { isNativeApp } from '@/lib/environment'
 import {
+  consumePendingNewSession,
   consumePendingSessionOpen,
+  setPendingNewSession,
   setPendingSessionOpen,
   satelliteInstances,
   useInstanceSessions,
@@ -13,7 +15,9 @@ import {
   useSatelliteSessionRefresh,
   useSatelliteTransports,
   type InstanceSession,
+  type JeanInstance,
 } from '@/services/instances'
+import { openNewWorktree } from '@/lib/open-new-worktree'
 import { useChatStore } from '@/store/chat-store'
 import { useProjectsStore } from '@/store/projects-store'
 import { InstanceSessionsSection } from './InstanceSessionsSection'
@@ -53,6 +57,22 @@ function usePendingSessionOpen(ready: boolean): void {
   }, [ready])
 }
 
+/**
+ * Replay a "new session here" request made on another instance before the
+ * connection switch reloaded the page.
+ *
+ * No project is passed: the composer opens on whatever the target instance has
+ * selected, which is the only project identity that means anything here —
+ * project ids are per-instance.
+ */
+function usePendingNewSession(ready: boolean): void {
+  useEffect(() => {
+    if (!ready) return
+    if (!consumePendingNewSession()) return
+    openNewWorktree()
+  }, [ready])
+}
+
 interface SatelliteInstancesProps {
   /** True once the focused instance's own projects have loaded. */
   ready: boolean
@@ -80,6 +100,7 @@ export function SatelliteInstances({ ready }: SatelliteInstancesProps) {
   useSatelliteTransports(instances)
   useSatelliteSessionRefresh(instances)
   usePendingSessionOpen(ready)
+  usePendingNewSession(ready)
 
   const sessions = useInstanceSessions(satellites)
 
@@ -108,6 +129,15 @@ export function SatelliteInstances({ ready }: SatelliteInstancesProps) {
     window.location.reload()
   }, [])
 
+  const handleNewSession = useCallback((instance: JeanInstance) => {
+    // Same switch, with no session to reopen: `usePendingNewSession` opens the
+    // composer once the target instance is in focus.
+    setPendingNewSession(instance.id)
+    markConnectionSwitch()
+    selectConnection(instance.id)
+    window.location.reload()
+  }, [])
+
   if (isNativeApp() || satellites.length === 0) return null
 
   return (
@@ -118,6 +148,7 @@ export function SatelliteInstances({ ready }: SatelliteInstancesProps) {
           instance={instance}
           sessions={sessionsByInstance.get(instance.id) ?? []}
           onOpenSession={handleOpenSession}
+          onNewSession={handleNewSession}
         />
       ))}
     </div>

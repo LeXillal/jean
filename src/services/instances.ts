@@ -186,6 +186,61 @@ export function consumePendingSessionOpen(): PendingSessionOpen | null {
   return parsed
 }
 
+// ---------------------------------------------------------------------------
+// Deferred "start a session here" across a connection switch
+// ---------------------------------------------------------------------------
+
+const PENDING_NEW_SESSION_KEY = 'jean-pending-new-session'
+
+/**
+ * Remember that the user asked for a new session on the instance being
+ * switched to.
+ *
+ * An instance with no session had no clickable row, so the only way in was the
+ * connection picker. This is the same deferred-intent trick as
+ * `setPendingSessionOpen`, minus a target: the composer opens on whatever
+ * project the target instance has selected, and lets the user pick another.
+ */
+export function setPendingNewSession(instanceId: string): void {
+  if (typeof window === 'undefined') return
+  window.sessionStorage.setItem(
+    PENDING_NEW_SESSION_KEY,
+    JSON.stringify({ instanceId, requestedAt: Date.now() })
+  )
+}
+
+/**
+ * Read the pending new-session intent, but only once the instance it was
+ * requested for is the focused one — same guard as
+ * `consumePendingSessionOpen`, for the same reason.
+ */
+export function consumePendingNewSession(): string | null {
+  if (typeof window === 'undefined') return null
+  const raw = window.sessionStorage.getItem(PENDING_NEW_SESSION_KEY)
+  if (!raw) return null
+
+  let parsed: { instanceId?: string; requestedAt?: number } | null = null
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    window.sessionStorage.removeItem(PENDING_NEW_SESSION_KEY)
+    return null
+  }
+
+  if (!parsed?.instanceId) {
+    window.sessionStorage.removeItem(PENDING_NEW_SESSION_KEY)
+    return null
+  }
+  if (Date.now() - (parsed.requestedAt ?? 0) > PENDING_OPEN_TTL_MS) {
+    window.sessionStorage.removeItem(PENDING_NEW_SESSION_KEY)
+    return null
+  }
+  if (parsed.instanceId !== getActiveConnectionId()) return null
+
+  window.sessionStorage.removeItem(PENDING_NEW_SESSION_KEY)
+  return parsed.instanceId
+}
+
 /**
  * Every registered instance, the local one first, with its live status.
  *
