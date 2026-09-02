@@ -1051,6 +1051,21 @@ mod tests {
     }
 
     #[test]
+    fn disable_2fa_is_a_flag_and_never_an_environment_variable() {
+        let from_flag = parse_cli_args_from(
+            ["jean", "--disable-2fa"],
+            std::iter::empty::<(&str, &str)>(),
+        )
+        .unwrap();
+        assert!(from_flag.disable_2fa);
+
+        // A stray env var in a unit file must not strip the second factor on
+        // every restart — recovery is a deliberate, one-off act.
+        let from_env = parse_cli_args_from(["jean"], [("JEAN_DISABLE_2FA", "1")]).unwrap();
+        assert!(!from_env.disable_2fa);
+    }
+
+    #[test]
     fn parse_cli_args_reads_allow_native_open_from_env_and_flag() {
         let from_env =
             parse_cli_args_from(["jean", "--headless"], [("JEAN_ALLOW_NATIVE_OPEN", "1")]).unwrap();
@@ -4266,6 +4281,10 @@ struct CliArgs {
     allow_unsafe_no_token: bool,
     /// Allow HTTP clients to open local file managers / editors / terminals.
     allow_native_open: bool,
+    /// Wipe the enrolled second factor and exit. The recovery path for a lost
+    /// phone: it needs local access to the machine, which already outranks the
+    /// authenticator app.
+    disable_2fa: bool,
 }
 
 /// CLI overrides for HTTP server configuration.
@@ -4294,6 +4313,8 @@ fn print_cli_help() {
     println!("                      Allow --no-token with a wildcard bind host");
     println!("  --allow-native-open Allow Open in editor/finder/terminal over HTTP");
     println!("                      (auto-enabled under WSL; off by default otherwise)");
+    println!("  --disable-2fa       Remove the enrolled second factor and exit");
+    println!("                      (recovery for a lost authenticator device)");
     println!("  --help              Show this help message");
     println!("  --version           Show version");
     println!();
@@ -4352,6 +4373,10 @@ where
     let mut allow_unsafe_no_token =
         env_truthy(env.get("JEAN_ALLOW_UNSAFE_NO_TOKEN").map(String::as_str));
     let mut allow_native_open = env_truthy(env.get("JEAN_ALLOW_NATIVE_OPEN").map(String::as_str));
+    // Deliberately flag-only, with no environment variable: an env var can be
+    // left behind in a unit file and silently strip the second factor on every
+    // restart. Recovery should be something you do once, on purpose.
+    let mut disable_2fa = false;
     let mut host = env
         .get("JEAN_HOST")
         .map(|h| h.trim().to_string())
@@ -4378,6 +4403,9 @@ where
         match arg.as_str() {
             "--headless" => {
                 headless = true;
+            }
+            "--disable-2fa" => {
+                disable_2fa = true;
             }
             "--host" => {
                 host = iter.next().cloned();
@@ -4437,6 +4465,7 @@ where
         no_token,
         allow_unsafe_no_token,
         allow_native_open,
+        disable_2fa,
     })
 }
 
@@ -4610,6 +4639,23 @@ pub async fn run_server() -> Result<(), String> {
     platform::set_allow_native_open(cli.allow_native_open);
     let context = RuntimeContext::from_environment()?;
     initialize_runtime(&context)?;
+
+    if cli.disable_2fa {
+        let dir = context
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("Failed to resolve app data dir: {e}"))?;
+        if http_server::totp::disable_from_disk(&dir)? {
+            println!(
+                "Two-factor authentication disabled. Restart the server if one is \
+                 already running — it keeps its own copy in memory — then log in \
+                 with the token alone and enroll a new device."
+            );
+        } else {
+            println!("Two-factor authentication was not enabled; nothing to do.");
+        }
+        return Ok(());
+    }
 
     let mut preferences = load_preferences(context.clone()).await.unwrap_or_default();
     if let Err(error) = sync_jean_mcp_socket_from_preferences(context.clone(), &preferences).await {

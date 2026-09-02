@@ -30,6 +30,7 @@ import { toast } from 'sonner'
 import { openExternal } from '@/lib/platform'
 import { copyToClipboard } from '@/lib/clipboard'
 import { SettingsSection } from '../SettingsSection'
+import { TwoFactorSection } from './TwoFactorSection'
 
 const LOOPBACK_BIND_HOSTS = new Set(['localhost', '127.0.0.1', '::1'])
 const WILDCARD_BIND_HOSTS = new Set(['0.0.0.0', '::'])
@@ -628,6 +629,14 @@ export const WebAccessPane: React.FC = () => {
           )}
         </div>
       </SettingsSection>
+
+      {/* Only meaningful while the server is up: the second factor lives in
+          the server process, and it is moot when the token is not required. */}
+      {serverStatus?.running && tokenRequired && (
+        <TwoFactorSection
+          target={{ url: serverStatus.url, token: serverStatus.token }}
+        />
+      )}
     </div>
   )
 }
