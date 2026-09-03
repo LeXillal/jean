@@ -274,6 +274,16 @@ impl SessionStore {
         }
     }
 
+    /// Revoke every session except the one currently performing a sensitive
+    /// operation, such as enabling 2FA.
+    pub fn revoke_all_except(&mut self, sid: Option<&str>) {
+        self.sessions
+            .retain(|session| sid.is_some_and(|current| session.sid == current));
+        if let Err(e) = self.persist() {
+            log::warn!("Failed to persist session revocation: {e}");
+        }
+    }
+
     /// Snapshot of live sessions, newest first — for an "active sessions" UI.
     pub fn active(&self, now: u64) -> Vec<SessionRecord> {
         let mut rows: Vec<SessionRecord> = self
@@ -340,6 +350,18 @@ mod tests {
         assert!(s.is_active(&b, 1_000));
         s.revoke_all();
         assert!(!s.is_active(&b, 1_000));
+    }
+
+    #[test]
+    fn store_revokes_all_except_current() {
+        let mut s = store();
+        let (current, _) = s.create("current".into(), 1_000);
+        let (other, _) = s.create("other".into(), 1_000);
+        s.revoke_all_except(Some(&current));
+        assert!(s.is_active(&current, 1_000));
+        assert!(!s.is_active(&other, 1_000));
+        s.revoke_all_except(None);
+        assert!(!s.is_active(&current, 1_000));
     }
 
     #[test]

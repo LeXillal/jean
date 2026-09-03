@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react'
 import QRCode from 'qrcode'
-import { ShieldCheck, ShieldOff } from 'lucide-react'
+import { ShieldCheck, ShieldOff, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -11,10 +11,14 @@ import {
   confirmTwoFactor,
   disableTwoFactor,
   fetchTwoFactorStatus,
+  fetchWebSessions,
   prepareNativeSession,
+  revokeOtherWebSessions,
+  revokeWebSession,
   unlockTwoFactor,
   type EnrollmentSecret,
   type TwoFactorTarget,
+  type WebSession,
 } from '@/lib/two-factor'
 import { SettingsSection } from '../SettingsSection'
 
@@ -41,6 +45,7 @@ export const TwoFactorSection: React.FC<{ target: TwoFactorTarget }> = ({
   const [code, setCode] = useState('')
   const [busy, setBusy] = useState(false)
   const [disarming, setDisarming] = useState(false)
+  const [sessions, setSessions] = useState<WebSession[]>([])
 
   const targetUrl = target.url
   const targetToken = target.token
@@ -53,10 +58,42 @@ export const TwoFactorSection: React.FC<{ target: TwoFactorTarget }> = ({
       })
       setEnabled(status.enabled)
       setLocked(status.locked === true)
+      if (status.enabled && !status.locked) {
+        setSessions(
+          await fetchWebSessions({ url: targetUrl, token: targetToken })
+        )
+      }
     } catch {
       // An older server has no such endpoint; leave the section quiet rather
       // than showing a scary error for a feature it simply does not have.
       setEnabled(null)
+    }
+  }, [targetUrl, targetToken])
+
+  const revokeSession = useCallback(
+    async (sid: string) => {
+      try {
+        await revokeWebSession({ url: targetUrl, token: targetToken }, sid)
+        if (sessions.find(session => session.sid === sid)?.current) {
+          window.location.reload()
+          return
+        }
+        setSessions(current => current.filter(session => session.sid !== sid))
+        toast.success('Session revoked.')
+      } catch (error) {
+        toast.error(getErrorMessage(error))
+      }
+    },
+    [sessions, targetUrl, targetToken]
+  )
+
+  const revokeOthers = useCallback(async () => {
+    try {
+      await revokeOtherWebSessions({ url: targetUrl, token: targetToken })
+      setSessions(current => current.filter(session => session.current))
+      toast.success('Other sessions revoked.')
+    } catch (error) {
+      toast.error(getErrorMessage(error))
     }
   }, [targetUrl, targetToken])
 
@@ -112,6 +149,9 @@ export const TwoFactorSection: React.FC<{ target: TwoFactorTarget }> = ({
       setEnrollment(null)
       setCode('')
       setEnabled(true)
+      setSessions(
+        await fetchWebSessions({ url: targetUrl, token: targetToken })
+      )
       toast.success(
         'Two-factor authentication enabled. Signing in now needs a code — other devices holding only the token will be signed out.'
       )
@@ -203,6 +243,46 @@ export const TwoFactorSection: React.FC<{ target: TwoFactorTarget }> = ({
               <ShieldOff className="size-4" />
               Turn off
             </Button>
+          )}
+          {!locked && sessions.length > 0 && (
+            <div className="space-y-2 border-t pt-3">
+              <div className="flex items-center justify-between gap-2">
+                <Label>Active sessions</Label>
+                {sessions.length > 1 && (
+                  <Button variant="outline" size="sm" onClick={revokeOthers}>
+                    Revoke others
+                  </Button>
+                )}
+              </div>
+              {sessions.map(session => (
+                <div
+                  key={session.sid}
+                  className="flex items-center justify-between gap-3 rounded-md border p-3"
+                >
+                  <div className="min-w-0 text-sm">
+                    <p className="truncate">
+                      {session.label || 'Unknown device'}
+                      {session.current && (
+                        <span className="ml-2 text-xs text-emerald-500">
+                          This device
+                        </span>
+                      )}
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      Created {new Date(session.issuedAt * 1000).toLocaleString()}
+                    </p>
+                  </div>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    aria-label={`Revoke ${session.label || 'session'}`}
+                    onClick={() => void revokeSession(session.sid)}
+                  >
+                    <Trash2 className="size-4" />
+                  </Button>
+                </div>
+              ))}
+            </div>
           )}
         </div>
       ) : enrollment ? (

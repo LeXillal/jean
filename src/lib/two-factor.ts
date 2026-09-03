@@ -25,6 +25,15 @@ export interface EnrollmentSecret {
   otpauth_url: string
 }
 
+export interface WebSession {
+  sid: string
+  issuedAt: number
+  lastSeen: number
+  expiresAt: number
+  label: string
+  current: boolean
+}
+
 /** Where to reach the server, and what proves who we are. */
 export interface TwoFactorTarget {
   /** Server base URL. Omitted in web mode, where the page origin is the server. */
@@ -185,4 +194,25 @@ export function disableTwoFactor(
     method: 'POST',
     body: JSON.stringify({ code }),
   })
+}
+
+export function fetchWebSessions(
+  target: TwoFactorTarget
+): Promise<WebSession[]> {
+  return request(target, 'api/sessions')
+}
+
+export function revokeWebSession(
+  target: TwoFactorTarget,
+  sid: string
+): Promise<{ ok: boolean }> {
+  return request(target, `api/sessions/${encodeURIComponent(sid)}`, {
+    method: 'DELETE',
+  })
+}
+
+export function revokeOtherWebSessions(
+  target: TwoFactorTarget
+): Promise<{ ok: boolean }> {
+  return request(target, 'api/sessions/revoke-others', { method: 'POST' })
 }

@@ -33,6 +33,23 @@ and never meet the phone.
 Consequence to expect: enabling 2FA signs out anything that was authenticating
 with the raw token until it logs in and obtains a session.
 
+Confirming enrollment also revokes every session except the one performing the
+confirmation. This closes sessions that may have been minted with a leaked
+token before 2FA was enabled, without disconnecting the operator doing setup.
+
+## Session management
+
+Active device sessions are listed in Settings → Web Access. Their public view
+contains only the session id, user-agent label, timestamps, and whether it is
+the current session; the signed credential is never returned.
+
+- `GET /api/sessions` lists active sessions.
+- `DELETE /api/sessions/{sid}` revokes one session.
+- `POST /api/sessions/revoke-others` keeps only the caller's session.
+
+These endpoints always require a live session. The raw access token cannot
+list or revoke sessions, even before 2FA is enabled.
+
 ## Transports
 
 The same signed session value reaches the server three ways, because the
