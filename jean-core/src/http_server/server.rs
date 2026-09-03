@@ -3,7 +3,7 @@ use axum::{
     extract::{ws::WebSocketUpgrade, Path as AxumPath, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
-    routing::{any, get, post},
+    routing::{any, delete, get, post},
     Json, Router,
 };
 use if_addrs::get_if_addrs;
@@ -303,6 +303,12 @@ pub async fn start_server(
         .route("/api/auth", get(auth_handler))
         .route("/api/login", post(login_handler))
         .route("/api/logout", post(logout_handler))
+        .route("/api/sessions", get(list_sessions_handler))
+        .route("/api/sessions/{sid}", delete(revoke_session_handler))
+        .route(
+            "/api/sessions/revoke-others",
+            post(revoke_other_sessions_handler),
+        )
         .route("/api/2fa", get(two_factor_status_handler))
         .route("/api/2fa/enroll", post(two_factor_enroll_handler))
         .route("/api/2fa/confirm", post(two_factor_confirm_handler))
@@ -819,6 +825,7 @@ async fn two_factor_confirm_handler(
     State(state): State<AppState>,
     Json(body): Json<TwoFactorCodeRequest>,
 ) -> Response {
+    let current_sid = active_session_sid(params.session.as_deref(), &headers, &state);
     if state.token_required
         && !request_is_authorized(
             params.token.as_deref(),
@@ -833,6 +840,12 @@ async fn two_factor_confirm_handler(
         return (StatusCode::INTERNAL_SERVER_ERROR, "2FA state lock poisoned").into_response();
     };
     if store.confirm_at(body.code.trim(), now_unix_secs()) {
+        drop(store);
+        if let Ok(mut sessions) = state.sessions.write() {
+            sessions.revoke_all_except(current_sid.as_deref());
+        } else {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "session store poisoned").into_response();
+        }
         log::info!("Two-factor authentication enabled");
         return Json(serde_json::json!({ "ok": true })).into_response();
     }
@@ -844,6 +857,89 @@ async fn two_factor_confirm_handler(
         })),
     )
         .into_response()
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicSession {
+    sid: String,
+    issued_at: u64,
+    last_seen: u64,
+    expires_at: u64,
+    label: String,
+    current: bool,
+}
+
+/// Session administration deliberately requires a live session. The raw
+/// access token never grants visibility into or control over device sessions.
+fn current_session_sid(
+    headers: &HeaderMap,
+    params: &WsAuth,
+    state: &AppState,
+) -> Result<String, Response> {
+    active_session_sid(params.session.as_deref(), headers, state)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Session required").into_response())
+}
+
+async fn list_sessions_handler(
+    headers: HeaderMap,
+    Query(params): Query<WsAuth>,
+    State(state): State<AppState>,
+) -> Response {
+    let current = match current_session_sid(&headers, &params, &state) {
+        Ok(sid) => sid,
+        Err(response) => return response,
+    };
+    let Ok(store) = state.sessions.read() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "session store poisoned").into_response();
+    };
+    Json(
+        store
+            .active(now_unix_secs())
+            .into_iter()
+            .map(|session| PublicSession {
+                current: session.sid == current,
+                sid: session.sid,
+                issued_at: session.issued_at,
+                last_seen: session.last_seen,
+                expires_at: session.expires_at,
+                label: session.label,
+            })
+            .collect::<Vec<_>>(),
+    )
+    .into_response()
+}
+
+async fn revoke_session_handler(
+    AxumPath(sid): AxumPath<String>,
+    headers: HeaderMap,
+    Query(params): Query<WsAuth>,
+    State(state): State<AppState>,
+) -> Response {
+    if current_session_sid(&headers, &params, &state).is_err() {
+        return (StatusCode::UNAUTHORIZED, "Session required").into_response();
+    }
+    let Ok(mut store) = state.sessions.write() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "session store poisoned").into_response();
+    };
+    store.revoke(&sid);
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+async fn revoke_other_sessions_handler(
+    headers: HeaderMap,
+    Query(params): Query<WsAuth>,
+    State(state): State<AppState>,
+) -> Response {
+    let current = match current_session_sid(&headers, &params, &state) {
+        Ok(sid) => sid,
+        Err(response) => return response,
+    };
+    let Ok(mut store) = state.sessions.write() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "session store poisoned").into_response();
+    };
+    store.revoke_all_except(Some(&current));
+    Json(serde_json::json!({ "ok": true })).into_response()
 }
 
 /// Turn 2FA off from the network, which requires a current code: an attacker
