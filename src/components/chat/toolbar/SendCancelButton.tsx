@@ -1,6 +1,6 @@
+import { ArrowUp, CornerDownLeft, Square } from 'lucide-react'
 import { getModifierSymbol, isClientMacOS } from '@/lib/platform'
 import { cn } from '@/lib/utils'
-import { Kbd } from '@/components/ui/kbd'
 import {
   Tooltip,
   TooltipContent,
@@ -19,6 +19,10 @@ interface SendCancelButtonProps {
   onCancel: () => void
 }
 
+/** Shared shape for every round icon action in the composer. */
+const iconButtonBase =
+  'flex size-8 shrink-0 items-center justify-center rounded-full transition-colors disabled:pointer-events-none disabled:opacity-50'
+
 export function SendCancelButton({
   isSending,
   canSend,
@@ -29,29 +33,31 @@ export function SendCancelButton({
 }: SendCancelButtonProps) {
   const isMobile = useIsMobile()
 
+  const cancelShortcut = isClientMacOS
+    ? `${getModifierSymbol()}+Option+Backspace`
+    : 'Ctrl+Alt+Backspace'
+
   if (isSending) {
+    const skip = Boolean(queuedMessageCount)
     const cancelButton = (
       <Tooltip>
         <TooltipTrigger asChild>
           <button
             type="button"
             onClick={onCancel}
+            aria-label={skip ? 'Skip to Next' : 'Cancel'}
             className={cn(
-              'flex h-8 items-center justify-center gap-1.5 px-3 text-xs font-medium transition-colors bg-primary text-primary-foreground hover:bg-primary/90'
+              iconButtonBase,
+              'bg-muted text-foreground hover:bg-muted/80'
             )}
           >
-            <span>{queuedMessageCount ? 'Skip to Next' : 'Cancel'}</span>
-            {!isMobile && (
-              <Kbd className="ml-0.5 h-4 text-[10px] bg-primary-foreground/20 text-primary-foreground">
-                {isClientMacOS ? `${getModifierSymbol()}⌥⌫` : 'Ctrl+Alt+⌫'}
-              </Kbd>
-            )}
+            <Square className="size-3.5 fill-current" />
           </button>
         </TooltipTrigger>
         <TooltipContent>
-          {queuedMessageCount
-            ? `Skip to next queued message (${isClientMacOS ? `${getModifierSymbol()}+Option+Backspace` : 'Ctrl+Alt+Backspace'})`
-            : `Cancel (${isClientMacOS ? `${getModifierSymbol()}+Option+Backspace` : 'Ctrl+Alt+Backspace'})`}
+          {skip
+            ? `Skip to next queued message (${cancelShortcut})`
+            : `Cancel (${cancelShortcut})`}
         </TooltipContent>
       </Tooltip>
     )
@@ -59,9 +65,7 @@ export function SendCancelButton({
     if (canSend) {
       const actionLabel = willSteer ? 'Steer' : 'Queue'
       const actionShortcut = steerWithModifier
-        ? isClientMacOS
-          ? `${getModifierSymbol()}↵`
-          : `${getModifierSymbol()}+Enter`
+        ? `${getModifierSymbol()}+Enter`
         : 'Enter'
       const actionTooltip = willSteer
         ? isMobile
@@ -72,19 +76,23 @@ export function SendCancelButton({
           : 'Queue message (Enter)'
 
       return (
-        <div className="flex items-center">
+        <div className="flex items-center gap-0.5">
           {cancelButton}
-          <div className="h-4 w-px shrink-0 bg-border/50" />
+          <div className="mx-0.5 h-4 w-px shrink-0 bg-border/50" />
           <Tooltip>
             <TooltipTrigger asChild>
               <button
                 type="submit"
                 aria-label={actionLabel}
-                className="flex h-8 items-center justify-center gap-1.5 px-2.5 text-xs font-medium transition-colors text-muted-foreground hover:bg-muted/80 hover:text-foreground"
+                className={cn(
+                  iconButtonBase,
+                  'text-muted-foreground hover:bg-muted/80 hover:text-foreground'
+                )}
               >
-                <span>{actionLabel}</span>
-                {!isMobile && (
-                  <Kbd className="h-4 text-[10px]">{actionShortcut}</Kbd>
+                {willSteer ? (
+                  <CornerDownLeft className="size-4" />
+                ) : (
+                  <ArrowUp className="size-4" />
                 )}
               </button>
             </TooltipTrigger>
@@ -103,14 +111,15 @@ export function SendCancelButton({
         <button
           type="submit"
           disabled={!canSend}
+          aria-label="Send"
           className={cn(
-            'flex h-8 items-center justify-center px-3 text-xs font-medium transition-colors disabled:pointer-events-none disabled:opacity-50',
+            iconButtonBase,
             canSend
               ? 'bg-primary text-primary-foreground hover:bg-primary/90'
-              : 'text-muted-foreground hover:bg-muted/80 hover:text-foreground'
+              : 'bg-muted text-muted-foreground'
           )}
         >
-          <span>Send</span>
+          <ArrowUp className="size-4" />
         </button>
       </TooltipTrigger>
       <TooltipContent>

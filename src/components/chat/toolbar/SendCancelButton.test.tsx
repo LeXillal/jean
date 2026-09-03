@@ -13,7 +13,7 @@ vi.mock('@/lib/platform', () => ({
 }))
 
 describe('SendCancelButton', () => {
-  it('renders a generic Send label while idle', () => {
+  it('renders a Send icon button while idle', () => {
     const { container } = render(
       <SendCancelButton
         isSending={false}
@@ -33,7 +33,8 @@ describe('SendCancelButton', () => {
     expect(
       screen.queryByRole('button', { name: /^yolo$/i })
     ).not.toBeInTheDocument()
-    expect(container.querySelector('svg')).toBeNull()
+    // The action is now an icon-only round button.
+    expect(container.querySelector('svg')).not.toBeNull()
   })
 
   it('renders Cancel while sending without queueing', () => {
@@ -66,11 +67,11 @@ describe('SendCancelButton', () => {
       screen.getByRole('button', { name: /skip to next/i })
     ).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /queue/i })).toBeInTheDocument()
-    expect(screen.getByText('Enter')).toBeInTheDocument()
     expect(
       screen.queryByRole('button', { name: /^steer$/i })
     ).not.toBeInTheDocument()
-    expect(container.querySelector('svg')).toBeNull()
+    // Both actions are icon-only round buttons.
+    expect(container.querySelectorAll('svg').length).toBeGreaterThanOrEqual(2)
   })
 
   it('renders Steer instead of Queue when auto-steer is enabled', () => {
@@ -86,13 +87,12 @@ describe('SendCancelButton', () => {
 
     expect(screen.getByRole('button', { name: /cancel/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /^steer$/i })).toBeInTheDocument()
-    expect(screen.getByText('Enter')).toBeInTheDocument()
     expect(
       screen.queryByRole('button', { name: /^queue$/i })
     ).not.toBeInTheDocument()
   })
 
-  it('renders the modifier shortcut when steer is temporarily forced', () => {
+  it('still renders Steer when steer is temporarily forced by modifier', () => {
     render(
       <SendCancelButton
         isSending
@@ -104,9 +104,9 @@ describe('SendCancelButton', () => {
       />
     )
 
-    expect(screen.getByRole('button', { name: /^steer$/i })).toHaveTextContent(
-      '⌘↵'
-    )
+    expect(
+      screen.getByRole('button', { name: /^steer$/i })
+    ).toBeInTheDocument()
   })
 
   it('renders the primary send/cancel action before queue or steer', () => {
