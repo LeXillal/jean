@@ -501,13 +501,8 @@ export const ChatToolbar = memo(function ChatToolbar({
         </AlertDialogContent>
       </AlertDialog>
 
-      <div
-        className={cn(
-          '@container flex px-4 py-2 md:px-6',
-          zenMode ? 'justify-end' : 'justify-start'
-        )}
-      >
-        <div className="inline-flex max-w-full flex-nowrap items-center overflow-x-auto whitespace-nowrap bg-transparent scrollbar-hide">
+      <div className="@container flex w-full items-center px-4 py-2 md:px-6">
+        <div className="flex min-w-0 flex-1 flex-nowrap items-center overflow-x-auto whitespace-nowrap bg-transparent scrollbar-hide">
           <div className={zenMode ? 'hidden' : 'contents'}>
             <DockBurgerButton className="flex @xl:hidden" />
 
@@ -678,17 +673,17 @@ export const ChatToolbar = memo(function ChatToolbar({
 
             <div className="h-4 w-px shrink-0 bg-border/50" />
           </div>
+        </div>
 
-          <div className="shrink-0">
-            <SendCancelButton
-              isSending={isSending}
-              canSend={canSend}
-              willSteer={willSteer}
-              steerWithModifier={steerWithModifier}
-              queuedMessageCount={queuedMessageCount}
-              onCancel={onCancel}
-            />
-          </div>
+        <div className="ml-auto shrink-0 pl-1">
+          <SendCancelButton
+            isSending={isSending}
+            canSend={canSend}
+            willSteer={willSteer}
+            steerWithModifier={steerWithModifier}
+            queuedMessageCount={queuedMessageCount}
+            onCancel={onCancel}
+          />
         </div>
 
         <ContextViewerDialog
