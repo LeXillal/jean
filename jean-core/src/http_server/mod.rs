@@ -4,6 +4,7 @@ pub mod dispatch;
 pub mod login_guard;
 pub mod remote_proxy;
 pub mod server;
+pub mod totp;
 pub mod websocket;
 
 use serde::Serialize;

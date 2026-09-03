@@ -60,11 +60,21 @@ pub(super) fn resolve_remote<'a>(
 
 /// Extract the `token` value from a raw query string, if present.
 fn token_from_raw_query(query: Option<&str>) -> Option<String> {
+    raw_query_param(query, "token")
+}
+
+/// Same, for the session value the native app carries when it cannot set a
+/// header (see `WsAuth::session`).
+fn session_from_raw_query(query: Option<&str>) -> Option<String> {
+    raw_query_param(query, "session")
+}
+
+fn raw_query_param(query: Option<&str>, key: &str) -> Option<String> {
     let query = query?;
     let probe = reqwest::Url::parse(&format!("http://x/?{query}")).ok()?;
     probe
         .query_pairs()
-        .find(|(key, _)| key == "token")
+        .find(|(name, _)| name == key)
         .map(|(_, value)| value.into_owned())
 }
 
@@ -252,7 +262,13 @@ pub(super) async fn remote_http_proxy_handler(
     // (a) Hub token auth.
     if state.token_required {
         let query_token = token_from_raw_query(uri.query());
-        if !request_is_authorized(query_token.as_deref(), &headers, &state) {
+        let query_session = session_from_raw_query(uri.query());
+        if !request_is_authorized(
+            query_token.as_deref(),
+            query_session.as_deref(),
+            &headers,
+            &state,
+        ) {
             return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
         }
     }
@@ -346,7 +362,12 @@ pub(super) async fn remote_ws_proxy_handler(
 ) -> Response {
     // Hub token auth, before the upgrade.
     if state.token_required
-        && !request_is_authorized(auth.token.as_deref(), &headers, &state)
+        && !request_is_authorized(
+            auth.token.as_deref(),
+            auth.session.as_deref(),
+            &headers,
+            &state,
+        )
     {
         return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
     }

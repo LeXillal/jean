@@ -98,7 +98,10 @@ import {
   collectWorktreePaths,
 } from './lib/initial-data-cache'
 import { useExternalLinkInterceptor } from './hooks/useExternalLinkInterceptor'
-import { WebAccessAuthScreen } from './components/web/WebAccessAuthScreen'
+import {
+  WebAccessAuthScreen,
+  type SignInResult,
+} from './components/web/WebAccessAuthScreen'
 import { peekWebReloadState, saveWebReloadState } from './lib/web-reload-state'
 import {
   clearConnectionSwitch,
@@ -118,7 +121,10 @@ interface AutoFixStoppedEvent {
   error: string
 }
 
-async function handleWsAuthTokenSubmit(token: string) {
+async function handleWsAuthTokenSubmit(
+  token: string,
+  code?: string
+): Promise<SignInResult> {
   // Prefer exchanging the token for an HttpOnly session cookie: it keeps the
   // long-lived token out of localStorage and out of the WebSocket URL. The
   // cookie is same-origin, so the browser sends it automatically afterwards.
@@ -127,20 +133,35 @@ async function handleWsAuthTokenSubmit(token: string) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'same-origin',
-      body: JSON.stringify({ token }),
+      body: JSON.stringify({ token, code }),
     })
     if (res.ok) {
       localStorage.removeItem('jean-http-token')
       window.location.reload()
-      return
+      return { ok: true }
+    }
+    // A refusal is an answer, not a broken endpoint: report it so the form can
+    // ask for the second factor (or say the token was wrong) without a reload
+    // that would throw the token away.
+    if (res.status === 400 || res.status === 401 || res.status === 429) {
+      const body = (await res.json().catch(() => null)) as {
+        error?: string
+        code_required?: boolean
+      } | null
+      return {
+        ok: false,
+        codeRequired: body?.code_required === true,
+        error: body?.error ?? 'Sign-in was refused.',
+      }
     }
   } catch {
-    // Endpoint missing (older server) or network error → legacy token path.
+    // Network error → legacy token path.
   }
   // Fallback: store the token so validateAndConnect re-checks it and surfaces
   // the correct error (or connects, on an older server without /api/login).
   localStorage.setItem('jean-http-token', token)
   window.location.reload()
+  return { ok: true }
 }
 
 /** Sign-in surface for web access mode, shown until the session is authorized. */
@@ -152,7 +173,13 @@ function WsAuthErrorOverlay() {
   if (!authError) return null
 
   if (remote) {
-    return <RemoteConnectionRecovery connection={remote} error={authError} />
+    return (
+      <RemoteConnectionRecovery
+        connection={remote}
+        error={authError}
+        reason={authReason}
+      />
+    )
   }
 
   return (

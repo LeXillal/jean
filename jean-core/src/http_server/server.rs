@@ -20,6 +20,7 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use super::assets;
 use super::auth;
 use super::login_guard;
+use super::totp;
 use super::websocket::handle_ws_connection;
 use super::EmitExt;
 use super::WsBroadcaster;
@@ -42,6 +43,10 @@ pub(super) struct AppState {
     pub(super) sessions: Arc<std::sync::RwLock<auth::SessionStore>>,
     /// Failed-login accounting for `/api/login`, per client address.
     pub(super) login_guard: Arc<login_guard::LoginGuard>,
+    /// Second-factor enrollment. When a secret is active the raw token stops
+    /// authorizing on its own: it becomes the first factor of `/api/login` and
+    /// nothing else, so a leaked token no longer opens a terminal.
+    pub(super) two_factor: Arc<std::sync::RwLock<totp::TwoFactorStore>>,
     /// Whether `X-Forwarded-For` may be believed when identifying a client.
     /// Only true when the deployment declares a reverse proxy in front, since
     /// the header is attacker-controlled otherwise.
@@ -80,6 +85,11 @@ pub struct ServerStatus {
 #[derive(Deserialize)]
 pub(super) struct WsAuth {
     pub(super) token: Option<String>,
+    /// Session value for clients that can neither hold a same-origin cookie nor
+    /// set a header: browsers refuse to attach custom headers to a WebSocket
+    /// handshake, so the native app puts its session here. Same signed value,
+    /// same verification — see `session_value_from_request`.
+    pub(super) session: Option<String>,
     /// Browser-provided selected project id. Overrides `ui_state.selected_project_id`
     /// when the disk copy is stale. Used to scope the init payload to only the
     /// worktrees/sessions the user is currently viewing.
@@ -234,14 +244,15 @@ pub async fn start_server(
 
     // Load (or create) the key that signs session cookies, plus the session
     // allowlist. Both live in app-data so sessions survive restarts.
-    let (session_key, sessions) = {
+    let (session_key, sessions, two_factor) = {
         let dir = app
             .path()
             .app_data_dir()
             .map_err(|e| format!("Failed to resolve app data dir: {e}"))?;
         let key = Arc::new(auth::load_or_create_session_key(&dir)?);
         let store = Arc::new(std::sync::RwLock::new(auth::SessionStore::load(&dir)));
-        (key, store)
+        let two_factor = Arc::new(std::sync::RwLock::new(totp::TwoFactorStore::load(&dir)));
+        (key, store, two_factor)
     };
     // Bind first so the real (possibly ephemeral) port is known before building
     // AppState — the remote proxy's anti-loop check compares against it.
@@ -272,6 +283,7 @@ pub async fn start_server(
         session_key,
         sessions,
         login_guard: Arc::new(login_guard::LoginGuard::new()),
+        two_factor,
         // Opt-in: only the operator knows whether something in front rewrites
         // the client address. Defaulting to true would let anyone spoof it.
         trust_proxy: std::env::var("JEAN_TRUSTED_PROXY")
@@ -291,6 +303,10 @@ pub async fn start_server(
         .route("/api/auth", get(auth_handler))
         .route("/api/login", post(login_handler))
         .route("/api/logout", post(logout_handler))
+        .route("/api/2fa", get(two_factor_status_handler))
+        .route("/api/2fa/enroll", post(two_factor_enroll_handler))
+        .route("/api/2fa/confirm", post(two_factor_confirm_handler))
+        .route("/api/2fa/disable", post(two_factor_disable_handler))
         .route("/api/commit-jobs", post(start_commit_job_handler))
         .route("/api/init", get(init_handler))
         .route(
@@ -423,7 +439,12 @@ async fn ws_handler(
 ) -> Response {
     // Validate token (skip if token not required)
     if state.token_required
-        && !request_is_authorized(params.token.as_deref(), &headers, &state)
+        && !request_is_authorized(
+            params.token.as_deref(),
+            params.session.as_deref(),
+            &headers,
+            &state,
+        )
     {
         return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
     }
@@ -461,7 +482,12 @@ async fn auth_handler(
         .into_response();
     }
 
-    if request_is_authorized(params.token.as_deref(), &headers, &state) {
+    if request_is_authorized(
+        params.token.as_deref(),
+        params.session.as_deref(),
+        &headers,
+        &state,
+    ) {
         let mut response = Json(serde_json::json!({
             "ok": true,
             "webBuildId": build_info.web_build_id,
@@ -471,7 +497,7 @@ async fn auth_handler(
         // Sliding expiry: the browser hits this endpoint on every connect, so a
         // session in regular use keeps getting a fresh TTL. `refresh` only acts
         // (and only writes) once the session is past half-life.
-        if let Some(sid) = active_session_sid(&headers, &state) {
+        if let Some(sid) = active_session_sid(params.session.as_deref(), &headers, &state) {
             let now = now_unix_secs();
             let refreshed = state
                 .sessions
@@ -502,6 +528,22 @@ async fn auth_handler(
 #[derive(Deserialize)]
 struct LoginRequest {
     token: String,
+    /// TOTP code, required once a second factor is enrolled. Absent on the
+    /// first attempt: the client only learns a code is needed after the token
+    /// checks out, so a stranger guessing tokens learns nothing about the
+    /// server's configuration.
+    #[serde(default)]
+    code: Option<String>,
+    /// How the caller wants to carry the session. Browsers omit this and get
+    /// the `HttpOnly` cookie, which JavaScript cannot read. The native app asks
+    /// for `"header"` and receives the value in the response body, because it
+    /// has no same-origin cookie jar to put it in.
+    ///
+    /// XSS in the browser cannot use this to exfiltrate a session: minting one
+    /// still requires the token (and the code), and after login neither is
+    /// anywhere JavaScript can reach.
+    #[serde(default)]
+    transport: Option<String>,
 }
 
 fn now_unix_secs() -> u64 {
@@ -527,6 +569,10 @@ fn request_is_https(headers: &HeaderMap) -> bool {
         })
         .unwrap_or(false)
 }
+
+/// Header the native app uses to carry its session value (see
+/// `session_value_from_headers`).
+pub(super) const SESSION_HEADER: &str = "x-jean-session";
 
 fn session_set_cookie(value: &str, secure: bool, max_age: u64) -> String {
     let mut cookie = format!(
@@ -607,10 +653,50 @@ async fn login_handler(
             .into_response();
     }
 
+    // Token accepted. If a second factor is enrolled it must also check out —
+    // otherwise a leaked token would still mint a session, which is the exact
+    // hole 2FA exists to close.
+    let now = now_unix_secs();
+    match verify_second_factor(&state, body.code.as_deref(), now) {
+        SecondFactor::NotEnrolled | SecondFactor::Accepted => {}
+        SecondFactor::Required => {
+            // Not a failed attempt: the client simply has not been asked yet.
+            // Penalising here would lock the owner out over their own two-step
+            // login. The code attempt that follows is what gets counted.
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "Enter the code from your authenticator app",
+                    "code_required": true,
+                })),
+            )
+                .into_response();
+        }
+        SecondFactor::Rejected(reason) => {
+            if let Some(client) = client {
+                if let Some(penalty) = state.login_guard.record_failure(client) {
+                    log::warn!(
+                        "Failed 2FA at /api/login from {client} ({reason}): blocking further attempts for {}s",
+                        penalty.as_secs()
+                    );
+                }
+            }
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": reason,
+                    "code_required": true,
+                })),
+            )
+                .into_response();
+        }
+    }
+
     if let Some(client) = client {
         state.login_guard.record_success(client);
     }
-    let now = now_unix_secs();
     let (sid, expires_at) = {
         let Ok(mut store) = state.sessions.write() else {
             return (StatusCode::INTERNAL_SERVER_ERROR, "session store poisoned").into_response();
@@ -618,6 +704,14 @@ async fn login_handler(
         store.create(auth::label_from_user_agent(&headers), now)
     };
     let value = auth::issue_session_cookie(&state.session_key, &sid, expires_at);
+    if body.transport.as_deref() == Some("header") {
+        return Json(serde_json::json!({
+            "ok": true,
+            "session": value,
+            "expires_at": expires_at,
+        }))
+        .into_response();
+    }
     json_ok_with_cookie(session_set_cookie(
         &value,
         request_is_https(&headers),
@@ -628,7 +722,7 @@ async fn login_handler(
 /// Sign out: revoke this device's session server-side (so its cookie stops
 /// working even if it was copied elsewhere) and tell the browser to drop it.
 async fn logout_handler(headers: HeaderMap, State(state): State<AppState>) -> Response {
-    if let Some(raw) = auth::session_cookie_from_headers(&headers) {
+    if let Some(raw) = session_value_from_request(None, &headers) {
         if let Some((sid, _)) = auth::parse_session_cookie(&state.session_key, &raw) {
             if let Ok(mut store) = state.sessions.write() {
                 store.revoke(&sid);
@@ -638,6 +732,158 @@ async fn logout_handler(headers: HeaderMap, State(state): State<AppState>) -> Re
     json_ok_with_cookie(session_set_cookie("", request_is_https(&headers), 0))
 }
 
+// ── Second factor (TOTP) ─────────────────────────────────────────────────────
+//
+// All three mutating endpoints require an already-authorized request. Before
+// enrollment that means the raw token, which is what lets a fresh server turn
+// 2FA on in the first place; afterwards only a live session qualifies, so the
+// phone is always involved in changing the phone's own role.
+
+#[derive(Deserialize)]
+struct TwoFactorCodeRequest {
+    #[serde(default)]
+    code: String,
+}
+
+/// Label an authenticator app shows for this server. Several Jean instances in
+/// one app are otherwise indistinguishable.
+fn two_factor_account_label(headers: &HeaderMap) -> String {
+    headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .unwrap_or("jean")
+        .to_string()
+}
+
+async fn two_factor_status_handler(
+    headers: HeaderMap,
+    Query(params): Query<WsAuth>,
+    State(state): State<AppState>,
+) -> Response {
+    if state.token_required
+        && !request_is_authorized(
+            params.token.as_deref(),
+            params.session.as_deref(),
+            &headers,
+            &state,
+        )
+    {
+        return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
+    }
+    Json(serde_json::json!({ "enabled": two_factor_enabled(&state) })).into_response()
+}
+
+/// Mint a pending secret and hand back what the app needs to scan it. The
+/// secret is not enforced until `/api/2fa/confirm` proves the app can produce a
+/// matching code.
+async fn two_factor_enroll_handler(
+    headers: HeaderMap,
+    Query(params): Query<WsAuth>,
+    State(state): State<AppState>,
+) -> Response {
+    if state.token_required
+        && !request_is_authorized(
+            params.token.as_deref(),
+            params.session.as_deref(),
+            &headers,
+            &state,
+        )
+    {
+        return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
+    }
+    let Ok(mut store) = state.two_factor.write() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "2FA state lock poisoned").into_response();
+    };
+    if store.is_enabled() {
+        // Re-enrolling would silently swap the secret out from under the phone
+        // that is currently guarding the server. Turn it off first, on purpose.
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "Two-factor authentication is already enabled. Disable it first to enroll a new device.",
+            })),
+        )
+            .into_response();
+    }
+    let secret = store.begin_enrollment();
+    let url = totp::otpauth_url(&secret, "Jean", &two_factor_account_label(&headers));
+    Json(serde_json::json!({ "ok": true, "secret": secret, "otpauth_url": url })).into_response()
+}
+
+async fn two_factor_confirm_handler(
+    headers: HeaderMap,
+    Query(params): Query<WsAuth>,
+    State(state): State<AppState>,
+    Json(body): Json<TwoFactorCodeRequest>,
+) -> Response {
+    if state.token_required
+        && !request_is_authorized(
+            params.token.as_deref(),
+            params.session.as_deref(),
+            &headers,
+            &state,
+        )
+    {
+        return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
+    }
+    let Ok(mut store) = state.two_factor.write() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "2FA state lock poisoned").into_response();
+    };
+    if store.confirm_at(body.code.trim(), now_unix_secs()) {
+        log::info!("Two-factor authentication enabled");
+        return Json(serde_json::json!({ "ok": true })).into_response();
+    }
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "ok": false,
+            "error": "That code did not match. Check your phone's clock and try the next one.",
+        })),
+    )
+        .into_response()
+}
+
+/// Turn 2FA off from the network, which requires a current code: an attacker
+/// who somehow holds a session must not be able to quietly remove the factor
+/// that would keep them out next time. Lost the phone? Use `--disable-2fa` on
+/// the machine itself.
+async fn two_factor_disable_handler(
+    headers: HeaderMap,
+    Query(params): Query<WsAuth>,
+    State(state): State<AppState>,
+    Json(body): Json<TwoFactorCodeRequest>,
+) -> Response {
+    if state.token_required
+        && !request_is_authorized(
+            params.token.as_deref(),
+            params.session.as_deref(),
+            &headers,
+            &state,
+        )
+    {
+        return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
+    }
+    let Ok(mut store) = state.two_factor.write() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "2FA state lock poisoned").into_response();
+    };
+    if !store.is_enabled() {
+        return Json(serde_json::json!({ "ok": true })).into_response();
+    }
+    if !store.matches_active_at(body.code.trim(), now_unix_secs()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "ok": false, "error": "Invalid code" })),
+        )
+            .into_response();
+    }
+    store.disable();
+    log::warn!("Two-factor authentication disabled");
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
 async fn start_commit_job_handler(
     headers: HeaderMap,
     Query(params): Query<WsAuth>,
@@ -645,7 +891,12 @@ async fn start_commit_job_handler(
     Json(request): Json<StartCommitJobRequest>,
 ) -> Response {
     if state.token_required
-        && !request_is_authorized(params.token.as_deref(), &headers, &state)
+        && !request_is_authorized(
+            params.token.as_deref(),
+            params.session.as_deref(),
+            &headers,
+            &state,
+        )
     {
         return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
     }
@@ -912,7 +1163,12 @@ async fn version_handler(
     State(state): State<AppState>,
 ) -> Response {
     if state.token_required
-        && !request_is_authorized(params.token.as_deref(), &headers, &state)
+        && !request_is_authorized(
+            params.token.as_deref(),
+            params.session.as_deref(),
+            &headers,
+            &state,
+        )
     {
         return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
     }
@@ -1011,7 +1267,12 @@ async fn init_handler(
 ) -> Response {
     // Validate token (skip if token not required)
     if state.token_required
-        && !request_is_authorized(params.token.as_deref(), &headers, &state)
+        && !request_is_authorized(
+            params.token.as_deref(),
+            params.session.as_deref(),
+            &headers,
+            &state,
+        )
     {
         return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
     }
@@ -1412,7 +1673,12 @@ async fn file_handler(
 ) -> Response {
     // Validate token
     if state.token_required
-        && !request_is_authorized(params.token.as_deref(), &headers, &state)
+        && !request_is_authorized(
+            params.token.as_deref(),
+            params.session.as_deref(),
+            &headers,
+            &state,
+        )
     {
         return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
     }
@@ -1492,7 +1758,12 @@ fn is_secret_app_data_file(path: &std::path::Path) -> bool {
 
 fn validate_token(params: &WsAuth, headers: &HeaderMap, state: &AppState) -> Result<(), Response> {
     if state.token_required
-        && !request_is_authorized(params.token.as_deref(), headers, state)
+        && !request_is_authorized(
+            params.token.as_deref(),
+            params.session.as_deref(),
+            headers,
+            state,
+        )
     {
         return Err((StatusCode::UNAUTHORIZED, "Invalid token").into_response());
     }
@@ -1795,23 +2066,122 @@ fn token_from_query_or_bearer(query_token: Option<&str>, headers: &HeaderMap) ->
 
 pub(super) fn request_is_authorized(
     query_token: Option<&str>,
+    query_session: Option<&str>,
     headers: &HeaderMap,
     state: &AppState,
 ) -> bool {
-    // Either a valid raw token (query/bearer, used by native + first login) or a
-    // live session cookie (browser, after /api/login) authorizes the request.
-    let token_ok = token_from_query_or_bearer(query_token, headers)
+    if active_session_sid(query_session, headers, state).is_some() {
+        return true;
+    }
+    // Evaluate the token only when it can still matter: the comparison is
+    // cheap, but skipping it keeps the rule in one place below.
+    let token_matches = token_from_query_or_bearer(query_token, headers)
         .as_deref()
         .is_some_and(|provided| auth::validate_token(provided, &state.token));
-    token_ok || active_session_sid(headers, state).is_some()
+    authorization_allows(false, two_factor_enabled(state), token_matches)
+}
+
+/// The rule itself, free of `AppState` so it can be asserted directly.
+///
+/// A live session always authorizes: it was minted by `/api/login`, which is
+/// where both factors were checked. The raw token authorizes only while no
+/// second factor is enrolled — once one is, the token is demoted to
+/// `/api/login`'s first factor. Leaving it usable here is what would let a
+/// leaked token reach `/ws`, and `/ws` hands out terminals.
+fn authorization_allows(
+    has_live_session: bool,
+    two_factor_enabled: bool,
+    token_matches: bool,
+) -> bool {
+    has_live_session || (token_matches && !two_factor_enabled)
+}
+
+/// Whether a second factor is enrolled.
+///
+/// A poisoned lock resolves to `true`: it downgrades the token to first-factor
+/// only, which costs a working client one login and never grants access that
+/// the intact state would have refused.
+fn two_factor_enabled(state: &AppState) -> bool {
+    match state.two_factor.read() {
+        Ok(store) => store.is_enabled(),
+        Err(_) => {
+            log::error!("2FA state lock poisoned; refusing raw-token authorization");
+            true
+        }
+    }
+}
+
+/// Outcome of the second-factor step of a login.
+enum SecondFactor {
+    NotEnrolled,
+    Accepted,
+    /// Enrolled, and the client has not sent a code yet.
+    Required,
+    /// Enrolled, code sent, code refused. Carries the message for the client.
+    Rejected(&'static str),
+}
+
+fn verify_second_factor(state: &AppState, code: Option<&str>, now: u64) -> SecondFactor {
+    let Ok(mut store) = state.two_factor.write() else {
+        log::error!("2FA state lock poisoned; refusing login");
+        return SecondFactor::Rejected("Server error verifying the code");
+    };
+    if !store.is_enabled() {
+        return SecondFactor::NotEnrolled;
+    }
+    let Some(code) = code.map(str::trim).filter(|code| !code.is_empty()) else {
+        return SecondFactor::Required;
+    };
+    match store.verify_login_at(code, now) {
+        totp::VerifyOutcome::Ok => SecondFactor::Accepted,
+        totp::VerifyOutcome::Invalid => SecondFactor::Rejected("Invalid code"),
+        // Honest wording: the code was right, but a one-time password used
+        // twice is either a double submit or someone replaying what they saw.
+        totp::VerifyOutcome::Replayed => {
+            SecondFactor::Rejected("That code was already used. Wait for the next one.")
+        }
+    }
+}
+
+/// Read the session value a request carries, from either transport.
+///
+/// Browsers send the `HttpOnly` cookie automatically. The native desktop app
+/// talks to the server cross-origin (`tauri://localhost`), where a cookie would
+/// need `SameSite=None` plus credentialed CORS; it sends the same signed value
+/// in `X-Jean-Session` instead. The value is identical and is verified
+/// identically — only the envelope differs.
+fn session_value_from_request(query_session: Option<&str>, headers: &HeaderMap) -> Option<String> {
+    let from_header = || {
+        headers
+            .get(SESSION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    };
+    let from_query = || {
+        query_session
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    };
+    // Cookie first: a browser's own credential outranks anything a query string
+    // or a proxy in the path may also have supplied.
+    auth::session_cookie_from_headers(headers)
+        .or_else(from_header)
+        .or_else(from_query)
 }
 
 /// Resolve the request's session cookie to a live `sid`: the signature must
 /// verify, the embedded expiry must be in the future, AND the sid must still be
 /// listed in the store (so a revoked device is rejected even though its cookie
 /// is still perfectly signed).
-fn active_session_sid(headers: &HeaderMap, state: &AppState) -> Option<String> {
-    let raw = auth::session_cookie_from_headers(headers)?;
+fn active_session_sid(
+    query_session: Option<&str>,
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Option<String> {
+    let raw = session_value_from_request(query_session, headers)?;
     let (sid, expires_at) = auth::parse_session_cookie(&state.session_key, &raw)?;
     let now = now_unix_secs();
     if expires_at <= now {
@@ -1938,14 +2308,72 @@ pub async fn get_server_status(app: AppHandle) -> ServerStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        bind_host_option_label, bind_host_option_rank, display_host_for_bind_ip,
-        display_ip_for_bind_ip_with_candidates, embedded_asset_path_for_request, format_http_url,
-        is_secret_app_data_file, is_tailscale_ipv4, load_remote_connections, merge_put_entries,
-        parse_bind_ip, path_is_in_known_roots, save_remote_connections, token_from_query_or_bearer,
-        validate_bind_host, RemoteConnectionEntry, RemoteConnectionInput, RemoteConnectionPublic,
+        authorization_allows, bind_host_option_label, bind_host_option_rank,
+        display_host_for_bind_ip, display_ip_for_bind_ip_with_candidates,
+        embedded_asset_path_for_request, format_http_url, is_secret_app_data_file,
+        is_tailscale_ipv4, load_remote_connections, merge_put_entries, parse_bind_ip,
+        path_is_in_known_roots, save_remote_connections, session_value_from_request,
+        token_from_query_or_bearer, validate_bind_host, RemoteConnectionEntry,
+        RemoteConnectionInput, RemoteConnectionPublic, SESSION_HEADER,
     };
     use axum::http::{HeaderMap, HeaderValue};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn a_valid_token_stops_authorizing_once_a_second_factor_is_enrolled() {
+        // Before enrollment the token is the whole credential.
+        assert!(authorization_allows(false, false, true));
+        // After it, the same token must not reach /ws on its own — that is the
+        // hole 2FA exists to close.
+        assert!(!authorization_allows(false, true, true));
+        // A session minted through /api/login (both factors) still works.
+        assert!(authorization_allows(true, true, false));
+        // And nothing lets a wrong token in either way.
+        assert!(!authorization_allows(false, false, false));
+    }
+
+    #[test]
+    fn session_value_is_read_from_the_cookie_or_the_native_header() {
+        let mut cookie_only = HeaderMap::new();
+        cookie_only.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_static("jean_session=v2.abc.99.sig"),
+        );
+        assert_eq!(
+            session_value_from_request(None, &cookie_only).as_deref(),
+            Some("v2.abc.99.sig")
+        );
+
+        let mut header_only = HeaderMap::new();
+        header_only.insert(SESSION_HEADER, HeaderValue::from_static("v2.def.99.sig"));
+        assert_eq!(
+            session_value_from_request(None, &header_only).as_deref(),
+            Some("v2.def.99.sig")
+        );
+
+        // An empty header is not a session; it must not shadow "no session".
+        let mut blank = HeaderMap::new();
+        blank.insert(SESSION_HEADER, HeaderValue::from_static("   "));
+        assert_eq!(session_value_from_request(None, &blank), None);
+
+        assert_eq!(session_value_from_request(None, &HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn the_cookie_wins_when_a_request_carries_both() {
+        // A browser proxying through something that also sets the header must
+        // keep using its own cookie, not the value someone else supplied.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_static("jean_session=v2.cookie.99.sig"),
+        );
+        headers.insert(SESSION_HEADER, HeaderValue::from_static("v2.header.99.sig"));
+        assert_eq!(
+            session_value_from_request(None, &headers).as_deref(),
+            Some("v2.cookie.99.sig")
+        );
+    }
 
     #[test]
     fn parse_bind_ip_accepts_localhost_and_ip_literals() {

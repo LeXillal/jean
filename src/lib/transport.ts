@@ -37,7 +37,12 @@ import {
  * - `rejected`    — a token was presented and the server refused it.
  * - `unreachable` — the server could not be reached or dropped the session.
  */
-export type WsAuthReason = 'signed-out' | 'rejected' | 'unreachable'
+export type WsAuthReason =
+  | 'signed-out'
+  | 'rejected'
+  | 'unreachable'
+  /** The token was accepted; the server is waiting for a 2FA code. */
+  | 'code-required'
 
 export function usesWebSocketBackend(): boolean {
   return !isNativeApp() || getActiveRemoteConnection() !== null
@@ -100,6 +105,22 @@ function getWebBackendToken(): string {
   return backendTokenFor(getActiveRemoteConnection())
 }
 
+/**
+ * Credential query string for URLs the browser fetches on its own — `<img>`
+ * sources and the like, which can carry neither a header nor, cross-origin, a
+ * cookie.
+ *
+ * Prefers the session: on a server with a second factor enrolled the raw token
+ * no longer authorizes anything, so a token-bearing asset URL would 401.
+ */
+function assetAuthParams(): string {
+  const remote = getActiveRemoteConnection()
+  const session = remoteSessionFor(remote)
+  if (session) return `?session=${encodeURIComponent(session)}`
+  const token = backendTokenFor(remote)
+  return token ? `?token=${encodeURIComponent(token)}` : ''
+}
+
 function backendUrlFor(remote: RemoteConnection | null, path: string): string {
   const base = `${backendBaseUrlFor(remote).replace(/\/+$/, '')}/`
   return new URL(path.replace(/^\/+/, ''), base).toString()
@@ -142,19 +163,155 @@ export async function probeConnectionServerInfo(connection: {
   return fetchRemoteServerInfoFromAuthUrl(proxiedRemoteAuthUrl(connection.id))
 }
 
+// ---------------------------------------------------------------------------
+// Native session credentials
+// ---------------------------------------------------------------------------
+//
+// A server with a second factor enrolled stops accepting the raw token on its
+// endpoints: the token becomes the first factor of `/api/login` and nothing
+// more. Browsers come out of that login holding an HttpOnly cookie; the native
+// app cannot (it talks cross-origin from `tauri://localhost`), so it asks for
+// the session value directly and carries it itself. Same signed value, same
+// server-side verification — and, unlike the token, revocable per device.
+
+function remoteSessionKey(id: string): string {
+  return `jean-remote-session:${id}`
+}
+
+/** The session this client holds for a remote, if it has logged in before. */
+function remoteSessionFor(remote: RemoteConnection | null): string | null {
+  if (!remote || !isNativeApp()) return null
+  return localStorage.getItem(remoteSessionKey(remote.id))
+}
+
+function storeRemoteSession(id: string, session: string): void {
+  localStorage.setItem(remoteSessionKey(id), session)
+}
+
+export function clearRemoteSession(id: string): void {
+  localStorage.removeItem(remoteSessionKey(id))
+}
+
+/** What a native sign-in attempt against a remote produced. */
+export type RemoteLoginResult =
+  | { ok: true }
+  /** Token fine, second factor needed (or the submitted code was refused). */
+  | { ok: false; codeRequired: true; error: string }
+  /** Token refused, or the server is too old to have `/api/login`. */
+  | { ok: false; codeRequired: false; error: string; legacy: boolean }
+
+/**
+ * Exchange a remote's token (plus a 2FA code when asked) for a session value.
+ *
+ * `legacy: true` means the endpoint is missing, not that the credentials were
+ * wrong — the caller falls back to raw-token auth, which such a server still
+ * accepts because it has no second factor to enforce.
+ */
+export async function loginRemoteForSession(
+  remote: RemoteConnection,
+  code?: string
+): Promise<RemoteLoginResult> {
+  const url = new URL(
+    'api/login',
+    `${remote.url.replace(/\/+$/, '')}/`
+  ).toString()
+  let res: Response
+  try {
+    res = await fetchBackendFor(remote, url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        token: remote.token ?? '',
+        code,
+        transport: 'header',
+      }),
+    })
+  } catch {
+    return {
+      ok: false,
+      codeRequired: false,
+      error: 'Could not reach the server.',
+      legacy: true,
+    }
+  }
+
+  if (res.ok) {
+    const body = (await res.json().catch(() => null)) as {
+      session?: string
+    } | null
+    if (!body?.session) {
+      // An older server answers `{ok:true}` with a cookie we cannot hold.
+      return {
+        ok: false,
+        codeRequired: false,
+        error: 'Server did not return a session.',
+        legacy: true,
+      }
+    }
+    storeRemoteSession(remote.id, body.session)
+    return { ok: true }
+  }
+
+  if (res.status === 404 || res.status === 405) {
+    return {
+      ok: false,
+      codeRequired: false,
+      error: 'Server has no session endpoint.',
+      legacy: true,
+    }
+  }
+
+  const body = (await res.json().catch(() => null)) as {
+    error?: string
+    code_required?: boolean
+  } | null
+  if (body?.code_required) {
+    return {
+      ok: false,
+      codeRequired: true,
+      error: body.error ?? 'Enter the code from your authenticator app.',
+      }
+  }
+  return {
+    ok: false,
+    codeRequired: false,
+    error: body?.error ?? 'That access token was refused.',
+    legacy: false,
+  }
+}
+
+/**
+ * Finish a native sign-in that stopped on the second factor. On success the
+ * page reloads, which is how every transport picks the new session up.
+ */
+export async function submitRemoteTwoFactorCode(
+  remote: RemoteConnection,
+  code: string
+): Promise<RemoteLoginResult> {
+  const result = await loginRemoteForSession(remote, code)
+  if (result.ok) window.location.reload()
+  return result
+}
+
 function fetchBackendFor(
   remote: RemoteConnection | null,
-  url: string
+  url: string,
+  init?: RequestInit
 ): Promise<Response> {
   // Same-origin hub requests have no timeout; a relayed hop can hang on a
   // remote that stopped answering, so it gets an abort budget.
-  if (!remote) return fetch(url)
+  if (!remote) return fetch(url, init)
 
+  const session = remoteSessionFor(remote)
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 12_000)
-  return fetch(url, { signal: controller.signal }).finally(() =>
-    clearTimeout(timeout)
-  )
+  return fetch(url, {
+    ...init,
+    headers: session
+      ? { ...init?.headers, 'X-Jean-Session': session }
+      : init?.headers,
+    signal: controller.signal,
+  }).finally(() => clearTimeout(timeout))
 }
 
 /**
@@ -239,8 +396,7 @@ export function convertFileSrc(filePath: string, protocol = 'asset'): string {
   }
 
   // Browser mode: convert server filesystem path to /api/files/ URL
-  const token = getWebBackendToken()
-  const params = token ? `?token=${encodeURIComponent(token)}` : ''
+  const params = assetAuthParams()
   const base = getWebAssetBaseUrl()
 
   // Try exact prefix match with cached app data dir
@@ -273,8 +429,7 @@ export function convertProjectFileSrc(filePath: string): string {
     return convertFileSrc(filePath)
   }
 
-  const token = getWebBackendToken()
-  const params = token ? `?token=${encodeURIComponent(token)}` : ''
+  const params = assetAuthParams()
   const base = getWebAssetBaseUrl()
   return `${base}/api/project-files/${encodeURIComponent(filePath)}${params}`
 }
@@ -842,12 +997,23 @@ class WsTransport {
     this.connect()
   }
 
-  private async validateAndConnect(token: string): Promise<void> {
+  /**
+   * @param afterLogin set when this call follows a successful session login, so
+   *   a second refusal cannot start another login and loop.
+   */
+  private async validateAndConnect(
+    token: string,
+    afterLogin = false
+  ): Promise<void> {
     const remote = this.remote
+    const session = remoteSessionFor(remote)
     const authBaseUrl = backendUrlFor(remote, 'api/auth')
-    const authUrl = token
-      ? `${authBaseUrl}?token=${encodeURIComponent(token)}`
-      : authBaseUrl
+    // A session travels in a header (added by `fetchBackendFor`), so it never
+    // needs to ride in the query string the way the token does.
+    const authUrl =
+      !session && token
+        ? `${authBaseUrl}?token=${encodeURIComponent(token)}`
+        : authBaseUrl
 
     try {
       const res = await fetchBackendFor(remote, authUrl)
@@ -860,6 +1026,24 @@ class WsTransport {
           this.setAuthError(null)
           this.scheduleConnectRetry()
           return
+        }
+        // Credentials refused. On a native remote that can simply mean the
+        // server now wants a session instead of a raw token — a second factor
+        // was enrolled, or the session we held was revoked. Try once to get a
+        // fresh one before treating this as the user's problem.
+        if (remote && isNativeApp() && !afterLogin) {
+          if (session) clearRemoteSession(remote.id)
+          const login = await loginRemoteForSession(remote)
+          if (login.ok) {
+            await this.validateAndConnect(token, true)
+            return
+          }
+          if (login.codeRequired) {
+            this.setAuthError(login.error, 'code-required')
+            return
+          }
+          // `legacy` means the server has no session endpoint at all, so the
+          // refusal above really was about the token. Fall through.
         }
         // Invalid token — clear it and wait for the user to provide another.
         // Only the focused transport may do this: a satellite must not sign
@@ -915,7 +1099,16 @@ class WsTransport {
   private connectWs(token: string): void {
     const base = new URL(backendUrlFor(this.remote, 'ws'))
     base.protocol = base.protocol === 'https:' ? 'wss:' : 'ws:'
-    base.searchParams.set('token', token)
+    // Browsers refuse to attach custom headers to a WebSocket handshake, so a
+    // native client's session has to travel in the query string here. It is
+    // still a better thing to put there than the token: it expires, and it can
+    // be revoked from the server without rotating anything.
+    const session = remoteSessionFor(this.remote)
+    if (session) {
+      base.searchParams.set('session', session)
+    } else {
+      base.searchParams.set('token', token)
+    }
     const url = base.toString()
 
     this.ws = new WebSocket(url)
