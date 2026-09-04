@@ -18,18 +18,55 @@ const root = resolve(__dirname, '..')
 const logPath = resolve(root, 'tmp/install-local-server.log')
 const childFlag = '--install-child'
 
+const manifestPath = 'src-server/Cargo.toml'
+
 export function buildInstallPlan({ env = process.env } = {}) {
   return {
     buildCommands: [
       ['bun', ['run', 'build']],
-      [
-        'cargo',
-        ['build', '--release', '--manifest-path', 'src-server/Cargo.toml'],
-      ],
+      ['cargo', ['build', '--release', '--manifest-path', manifestPath]],
     ],
+    // Fallback only: a plain, single-crate layout. The real path is resolved
+    // from cargo at install time, so a workspace target dir or a custom
+    // CARGO_TARGET_DIR still finds the binary. See `resolveBuiltBinary`.
     builtBinary: resolve(root, 'src-server/target/release/jean-server'),
     installPath: env.JEAN_SERVER_INSTALL_PATH ?? '/usr/local/bin/jean-server',
     service: env.JEAN_SERVER_SERVICE ?? 'jean-server.service',
+  }
+}
+
+/**
+ * Ask cargo where it actually put the release binary.
+ *
+ * `cargo metadata` reports `target_directory`, which honours a workspace root
+ * and `CARGO_TARGET_DIR` alike — unlike the `src-server/target/...` guess, which
+ * is wrong whenever either is in play. Any failure (cargo missing, bad JSON)
+ * falls back to that guess so the caller can still surface a clear "not found".
+ */
+export function resolveBuiltBinary({
+  fallback,
+  cwd = root,
+  spawnSyncImpl = spawnSync,
+} = {}) {
+  try {
+    const result = spawnSyncImpl(
+      'cargo',
+      [
+        'metadata',
+        '--no-deps',
+        '--format-version',
+        '1',
+        '--manifest-path',
+        manifestPath,
+      ],
+      { cwd, encoding: 'utf8' }
+    )
+    if (result.status !== 0 || !result.stdout) return fallback
+    const targetDirectory = JSON.parse(result.stdout).target_directory
+    if (!targetDirectory) return fallback
+    return resolve(targetDirectory, 'release/jean-server')
+  } catch {
+    return fallback
   }
 }
 
@@ -138,14 +175,15 @@ async function main() {
   for (const [command, commandArgs] of plan.buildCommands) {
     run(command, commandArgs)
   }
-  if (!existsSync(plan.builtBinary)) {
-    throw new Error(`Built jean-server not found: ${plan.builtBinary}`)
+  const builtBinary = resolveBuiltBinary({ fallback: plan.builtBinary })
+  if (!existsSync(builtBinary)) {
+    throw new Error(`Built jean-server not found: ${builtBinary}`)
   }
 
   const temporaryPath = `${plan.installPath}.new-${process.pid}`
   mkdirSync(dirname(plan.installPath), { recursive: true })
   try {
-    copyFileSync(plan.builtBinary, temporaryPath)
+    copyFileSync(builtBinary, temporaryPath)
     chmodSync(temporaryPath, 0o755)
     renameSync(temporaryPath, plan.installPath)
   } finally {
