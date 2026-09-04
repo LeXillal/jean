@@ -2,7 +2,6 @@ import { memo, useCallback, useEffect, useMemo, useState } from 'react'
 import { Zap } from 'lucide-react'
 import { dismissibleToast } from '@/lib/dismissible-toast'
 import { invoke } from '@/lib/transport'
-import { cn } from '@/lib/utils'
 import { useUIStore } from '@/store/ui-store'
 import {
   gitPush,
