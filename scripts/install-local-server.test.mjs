@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   buildInstallPlan,
   getLinuxBuildDependenciesError,
+  resolveBuiltBinary,
   shouldStartBackground,
 } from './install-local-server.mjs'
 
@@ -32,6 +33,27 @@ test('buildInstallPlan supports an explicit binary and service', () => {
 
   assert.equal(plan.installPath, '/opt/jean/jean-server-dev')
   assert.equal(plan.service, 'jean-dev.service')
+})
+
+test('resolveBuiltBinary uses cargo target_directory', () => {
+  const binary = resolveBuiltBinary({
+    fallback: '/fallback/jean-server',
+    spawnSyncImpl: () => ({
+      status: 0,
+      stdout: JSON.stringify({ target_directory: '/root/.cache/cargo-target' }),
+    }),
+  })
+
+  assert.equal(binary, '/root/.cache/cargo-target/release/jean-server')
+})
+
+test('resolveBuiltBinary falls back when cargo metadata fails', () => {
+  const binary = resolveBuiltBinary({
+    fallback: '/fallback/jean-server',
+    spawnSyncImpl: () => ({ status: 1, stdout: '' }),
+  })
+
+  assert.equal(binary, '/fallback/jean-server')
 })
 
 test('shouldStartBackground stays foreground for explicit foreground or the child process', () => {
