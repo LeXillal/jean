@@ -21,7 +21,7 @@ interface SendCancelButtonProps {
 
 /** Shared shape for every round icon action in the composer. */
 const iconButtonBase =
-  'flex size-8 shrink-0 items-center justify-center rounded-full transition-colors disabled:pointer-events-none disabled:opacity-50'
+  'flex shrink-0 items-center justify-center rounded-full transition-colors disabled:pointer-events-none disabled:opacity-50'
 
 export function SendCancelButton({
   isSending,
@@ -32,6 +32,9 @@ export function SendCancelButton({
   onCancel,
 }: SendCancelButtonProps) {
   const isMobile = useIsMobile()
+
+  // 44px touch target on mobile (Apple HIG), 32px on desktop.
+  const iconSize = isMobile ? 'size-11' : 'size-8'
 
   const cancelShortcut = isClientMacOS
     ? `${getModifierSymbol()}+Option+Backspace`
@@ -48,6 +51,7 @@ export function SendCancelButton({
             aria-label={skip ? 'Skip to Next' : 'Cancel'}
             className={cn(
               iconButtonBase,
+              iconSize,
               'group relative bg-muted text-foreground hover:bg-destructive/10 hover:text-destructive'
             )}
           >
@@ -90,6 +94,7 @@ export function SendCancelButton({
                 aria-label={actionLabel}
                 className={cn(
                   iconButtonBase,
+                  iconSize,
                   'text-muted-foreground hover:bg-muted/80 hover:text-foreground'
                 )}
               >
@@ -118,6 +123,7 @@ export function SendCancelButton({
           aria-label="Send"
           className={cn(
             iconButtonBase,
+            iconSize,
             'group',
             canSend
               ? 'bg-primary text-primary-foreground hover:bg-primary/90'
@@ -126,9 +132,11 @@ export function SendCancelButton({
         >
           <Send
             className={cn(
-              'size-4 transition-transform duration-200 ease-out',
+              // The paper plane's mass sits low-left in its box; nudge it
+              // up-right so it reads optically centred in the round button.
+              'size-4 translate-x-px -translate-y-px transition-transform duration-200 ease-out',
               canSend &&
-                'group-hover:-translate-y-px group-hover:translate-x-px group-hover:-rotate-12 group-active:-translate-y-1 group-active:translate-x-1 group-active:-rotate-45'
+                'group-hover:translate-x-0.5 group-hover:-translate-y-0.5 group-hover:-rotate-12 group-active:translate-x-1 group-active:-translate-y-1 group-active:-rotate-45'
             )}
           />
         </button>
