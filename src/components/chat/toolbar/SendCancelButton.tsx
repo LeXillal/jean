@@ -132,11 +132,9 @@ export function SendCancelButton({
         >
           <Send
             className={cn(
-              // The paper plane's mass sits low-left in its box; nudge it
-              // up-right so it reads optically centred in the round button.
-              'size-4 translate-x-px -translate-y-px transition-transform duration-200 ease-out',
+              'size-4 transition-transform duration-200 ease-out',
               canSend &&
-                'group-hover:translate-x-0.5 group-hover:-translate-y-0.5 group-hover:-rotate-12 group-active:translate-x-1 group-active:-translate-y-1 group-active:-rotate-45'
+                'group-hover:-translate-y-0.5 group-active:-translate-y-1'
             )}
           />
         </button>
