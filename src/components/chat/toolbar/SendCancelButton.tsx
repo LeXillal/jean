@@ -48,10 +48,14 @@ export function SendCancelButton({
             aria-label={skip ? 'Skip to Next' : 'Cancel'}
             className={cn(
               iconButtonBase,
-              'bg-muted text-foreground hover:bg-muted/80'
+              'group relative bg-muted text-foreground hover:bg-destructive/10 hover:text-destructive'
             )}
           >
-            <Square className="size-3.5 fill-current" />
+            <span
+              aria-hidden
+              className="pointer-events-none absolute -inset-0.5 animate-spin rounded-full border-2 border-transparent border-t-primary/70 [animation-duration:1.2s] group-hover:border-t-destructive/70"
+            />
+            <Square className="size-3.5 fill-current transition-transform duration-200 ease-out group-hover:scale-90" />
           </button>
         </TooltipTrigger>
         <TooltipContent>
