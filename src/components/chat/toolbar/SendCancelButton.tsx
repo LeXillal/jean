@@ -1,4 +1,4 @@
-import { ArrowUp, CornerDownLeft, Square } from 'lucide-react'
+import { ArrowUp, CornerDownLeft, Send, Square } from 'lucide-react'
 import { getModifierSymbol, isClientMacOS } from '@/lib/platform'
 import { cn } from '@/lib/utils'
 import {
@@ -114,12 +114,19 @@ export function SendCancelButton({
           aria-label="Send"
           className={cn(
             iconButtonBase,
+            'group',
             canSend
               ? 'bg-primary text-primary-foreground hover:bg-primary/90'
               : 'bg-muted text-muted-foreground'
           )}
         >
-          <ArrowUp className="size-4" />
+          <Send
+            className={cn(
+              'size-4 transition-transform duration-200 ease-out',
+              canSend &&
+                'group-hover:-translate-y-px group-hover:translate-x-px group-hover:-rotate-12 group-active:-translate-y-1 group-active:translate-x-1 group-active:-rotate-45'
+            )}
+          />
         </button>
       </TooltipTrigger>
       <TooltipContent>
