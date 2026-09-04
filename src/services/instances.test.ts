@@ -41,12 +41,14 @@ import {
   consumePendingNewSession,
   consumePendingSessionOpen,
   deriveSatelliteSessionStatus,
+  groupSessionsByProject,
   instanceSessionKey,
   satelliteInstances,
   setPendingNewSession,
   setPendingSessionOpen,
   useInstanceSessions,
   useSatelliteTransports,
+  type InstanceSession,
   type JeanInstance,
 } from './instances'
 
@@ -344,5 +346,111 @@ describe('sidebar aggregation opt-out', () => {
     expect(releaseTransport).toHaveBeenCalledWith('b')
     // The focused instance drives the main UI: never release it.
     expect(releaseTransport).not.toHaveBeenCalledWith('local')
+  })
+})
+
+describe('groupSessionsByProject', () => {
+  function row(overrides: Partial<InstanceSession> = {}): InstanceSession {
+    const instanceId = overrides.instanceId ?? 'a'
+    const sessionId = overrides.session?.id ?? 's1'
+    return {
+      instanceId,
+      instanceName: 'Server A',
+      projectId: 'p1',
+      projectName: 'Jean',
+      worktreeId: 'w1',
+      worktreeName: 'main',
+      worktreePath: '/root/dev/jean',
+      session: makeSession({ id: sessionId }),
+      status: 'idle',
+      unread: false,
+      key: instanceSessionKey(instanceId, sessionId),
+      ...overrides,
+    }
+  }
+
+  it('splits one instance into a section per project', () => {
+    const groups = groupSessionsByProject(
+      [
+        row({ projectId: 'p1', projectName: 'Jean' }),
+        row({
+          projectId: 'p2',
+          projectName: 'Site',
+          session: makeSession({ id: 's2' }),
+        }),
+      ],
+      [instance('a', 'Server A')]
+    )
+
+    expect(groups.map(g => g.projectName)).toEqual(['Jean', 'Site'])
+    expect(groups.map(g => g.key)).toEqual(['a::p1', 'a::p2'])
+  })
+
+  it('does not merge same-named projects from different instances', () => {
+    const groups = groupSessionsByProject(
+      [
+        row({ instanceId: 'a', projectId: 'p1', projectName: 'Jean' }),
+        row({
+          instanceId: 'b',
+          projectId: 'p1',
+          projectName: 'Jean',
+          session: makeSession({ id: 's2' }),
+        }),
+      ],
+      [instance('a', 'Server A'), instance('b', 'Server B')]
+    )
+
+    expect(groups).toHaveLength(2)
+    expect(groups.map(g => g.instance.id)).toEqual(['a', 'b'])
+  })
+
+  it('keeps the input recency order across projects', () => {
+    // Input is pre-sorted most-recent-first; the first project seen wins the top
+    // slot, so a Map preserving insertion order is enough.
+    const groups = groupSessionsByProject(
+      [
+        row({ projectId: 'p2', projectName: 'Site' }),
+        row({
+          projectId: 'p1',
+          projectName: 'Jean',
+          session: makeSession({ id: 's2' }),
+        }),
+      ],
+      [instance('a', 'Server A')]
+    )
+
+    expect(groups.map(g => g.projectName)).toEqual(['Site', 'Jean'])
+  })
+
+  it('appends an empty section for a session-less instance', () => {
+    const groups = groupSessionsByProject(
+      [row({ instanceId: 'a' })],
+      [instance('a', 'Server A'), instance('b', 'Server B')]
+    )
+
+    const empty = groups.find(g => g.instance.id === 'b')
+    expect(empty?.projectName).toBeUndefined()
+    expect(empty?.sessions).toEqual([])
+    expect(empty?.key).toBe('b::__empty')
+  })
+
+  it('collapses an unreachable instance to a single empty section', () => {
+    // Its cached rows must not fan out into project sections that each repeat
+    // the offline notice.
+    const groups = groupSessionsByProject(
+      [
+        row({ instanceId: 'a', projectId: 'p1' }),
+        row({
+          instanceId: 'a',
+          projectId: 'p2',
+          session: makeSession({ id: 's2' }),
+        }),
+      ],
+      [instance('a', 'Server A', { status: 'offline' })]
+    )
+
+    expect(groups).toHaveLength(1)
+    expect(groups[0]?.projectName).toBeUndefined()
+    expect(groups[0]?.sessions).toEqual([])
   })
 })

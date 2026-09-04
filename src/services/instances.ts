@@ -92,6 +92,67 @@ export function instanceSessionKey(
   return `${instanceId}::${sessionId}`
 }
 
+/** One sidebar section: the sessions of a single project on a single instance. */
+export interface ProjectSessionGroup {
+  /** Stable per (instance, project); also the React key. */
+  key: string
+  instance: JeanInstance
+  /** Undefined for the trailing "empty instance" section. */
+  projectName?: string
+  sessions: InstanceSession[]
+}
+
+/**
+ * Turn a flat, recency-sorted list of satellite sessions into one section per
+ * (instance, project).
+ *
+ * Grouping is by project, not by instance: the instance a session lives on is
+ * an implementation detail here, the project is what the user tracks. The key is
+ * still composite because a `projectId` is only unique within its instance.
+ *
+ * Order follows the input (most recently active first), so the project with the
+ * freshest session floats to the top. Every satellite that produced no section
+ * gets a trailing empty one, so a session-less or unreachable instance stays
+ * reachable instead of vanishing from the sidebar.
+ */
+export function groupSessionsByProject(
+  sessions: InstanceSession[],
+  satellites: JeanInstance[]
+): ProjectSessionGroup[] {
+  const instanceById = new Map(satellites.map(instance => [instance.id, instance]))
+  const byKey = new Map<string, ProjectSessionGroup>()
+
+  for (const item of sessions) {
+    const instance = instanceById.get(item.instanceId)
+    if (!instance) continue
+    // Cached rows from an unreachable instance must not spawn project sections;
+    // that instance gets a single offline section from the loop below instead.
+    if (instance.status === 'offline' || instance.status === 'auth-error') {
+      continue
+    }
+    const key = `${item.instanceId}::${item.projectId}`
+    const existing = byKey.get(key)
+    if (existing) {
+      existing.sessions.push(item)
+    } else {
+      byKey.set(key, {
+        key,
+        instance,
+        projectName: item.projectName,
+        sessions: [item],
+      })
+    }
+  }
+
+  const groups = [...byKey.values()]
+  const seen = new Set(groups.map(group => group.instance.id))
+  for (const instance of satellites) {
+    if (seen.has(instance.id)) continue
+    groups.push({ key: `${instance.id}::__empty`, instance, sessions: [] })
+  }
+  return groups
+}
+
 /** Status shown for a session that belongs to a non-focused instance. */
 export type SatelliteSessionStatus = 'running' | 'waiting' | 'review' | 'idle'
 
