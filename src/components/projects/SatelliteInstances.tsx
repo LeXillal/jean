@@ -7,6 +7,7 @@ import { isNativeApp } from '@/lib/environment'
 import {
   consumePendingNewSession,
   consumePendingSessionOpen,
+  groupSessionsByProject,
   setPendingNewSession,
   setPendingSessionOpen,
   satelliteInstances,
@@ -104,15 +105,10 @@ export function SatelliteInstances({ ready }: SatelliteInstancesProps) {
 
   const sessions = useInstanceSessions(satellites)
 
-  const sessionsByInstance = useMemo(() => {
-    const grouped = new Map<string, InstanceSession[]>()
-    for (const item of sessions) {
-      const bucket = grouped.get(item.instanceId)
-      if (bucket) bucket.push(item)
-      else grouped.set(item.instanceId, [item])
-    }
-    return grouped
-  }, [sessions])
+  const groups = useMemo(
+    () => groupSessionsByProject(sessions, satellites),
+    [sessions, satellites]
+  )
 
   const handleOpenSession = useCallback((item: InstanceSession) => {
     // The target lives on another server: record it, then switch. The reload
@@ -142,11 +138,12 @@ export function SatelliteInstances({ ready }: SatelliteInstancesProps) {
 
   return (
     <div className="border-t border-border/50 pt-1">
-      {satellites.map(instance => (
+      {groups.map(group => (
         <InstanceSessionsSection
-          key={instance.id}
-          instance={instance}
-          sessions={sessionsByInstance.get(instance.id) ?? []}
+          key={group.key}
+          instance={group.instance}
+          projectName={group.projectName}
+          sessions={group.sessions}
           onOpenSession={handleOpenSession}
           onNewSession={handleNewSession}
         />

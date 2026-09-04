@@ -28,24 +28,33 @@ const CONNECTION_DOT: Record<InstanceStatus, string> = {
 
 interface InstanceSessionsSectionProps {
   instance: JeanInstance
+  /**
+   * The project this section groups. Undefined for the trailing "empty
+   * instance" section, which falls back to the instance name in its header.
+   */
+  projectName?: string
   sessions: InstanceSession[]
   onOpenSession: (session: InstanceSession) => void
   onNewSession: (instance: JeanInstance) => void
 }
 
 /**
- * One collapsible section per non-focused Jean instance.
+ * One collapsible section per (instance, project) among the non-focused Jean
+ * instances — the header shows the project, not the instance it happens to live
+ * on. A session-less or unreachable instance still gets one section (with no
+ * project) so it stays reachable.
  *
  * Rows are read-only: they come from a background transport, so they carry no
  * live chat-store state. Clicking one switches focus to that instance and
  * opens the session there.
  *
- * The header's "+" does the same switch with no target, so an instance with no
- * session is still reachable from here instead of only from the connection
- * picker.
+ * The header's "+" does the same switch with no target, so a project with no
+ * session — or an empty instance — is still reachable from here instead of only
+ * from the connection picker.
  */
 function InstanceSessionsSectionImpl({
   instance,
+  projectName,
   sessions,
   onOpenSession,
   onNewSession,
@@ -55,6 +64,11 @@ function InstanceSessionsSectionImpl({
 
   const unreachable =
     instance.status === 'offline' || instance.status === 'auth-error'
+
+  const title = projectName ?? instance.name
+  const newSessionLabel = projectName
+    ? `New session in ${projectName}`
+    : `New session on ${instance.name}`
 
   const handleNewSession = useCallback(
     () => onNewSession(instance),
@@ -89,7 +103,7 @@ function InstanceSessionsSectionImpl({
             <TooltipContent>{CONNECTION_LABEL[instance.status]}</TooltipContent>
           </Tooltip>
           <span className="min-w-0 flex-1 truncate text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/50">
-            {instance.name}
+            {title}
           </span>
           {sessions.length > 0 && (
             <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground/40">
@@ -104,12 +118,12 @@ function InstanceSessionsSectionImpl({
                 type="button"
                 onClick={handleNewSession}
                 className="shrink-0 rounded p-0.5 text-muted-foreground/50 opacity-0 transition-opacity hover:bg-muted/60 hover:text-foreground focus-visible:opacity-100 group-hover/header:opacity-100"
-                aria-label={`New session on ${instance.name}`}
+                aria-label={newSessionLabel}
               >
                 <Plus className="size-3.5" />
               </button>
             </TooltipTrigger>
-            <TooltipContent>New session on {instance.name}</TooltipContent>
+            <TooltipContent>{newSessionLabel}</TooltipContent>
           </Tooltip>
         )}
       </div>
